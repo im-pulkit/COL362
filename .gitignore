@@ -1,0 +1,6 @@
+/target
+**/*.json
+/scratch
+**/*.csv
+**/*.schema
+**/*.bin

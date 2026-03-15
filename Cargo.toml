@@ -1,0 +1,19 @@
+[workspace]
+members = [
+    "common",
+    "database",
+    "disk",
+    "generator",
+    "fd_wrapper",
+    "monitor",
+    "configs/disk_config",
+    "configs/db_config",
+    "configs/monitor_config",
+    "demo_query_printer",
+]
+
+resolver = "3"
+
+[profile.profiling]
+inherits = "release"
+debug = true
