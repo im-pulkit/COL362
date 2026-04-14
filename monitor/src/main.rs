@@ -7,11 +7,12 @@ use monitor_config::{
 };
 use std::{
     fs::File,
-    io::{BufRead, BufReader, PipeReader, PipeWriter, Read, Write, pipe},
+    io::{BufRead, BufReader, Read, Write,},
     os::{fd::AsRawFd, unix::process::CommandExt},
     path::PathBuf,
     process::{Child, Command},
 };
+use os_pipe::{pipe, PipeReader, PipeWriter};
 
 use crate::{
     cli::CliOptions,
@@ -102,34 +103,54 @@ fn setup_db_process(
     Ok((db_process_child, db_to_monitor_reader, monitor_to_db_writer))
 }
 
-fn validate(db_in: &mut impl BufRead, expected_output_file_path: &PathBuf) -> Result<()> {
-    let mut expected_output_reader = BufReader::new(File::open(expected_output_file_path)?);
-    let mut line_count = 0;
-
+fn validate(
+    db_in: &mut impl BufRead,
+    expected_output_file_path: &PathBuf,
+    sort_before_check: bool,
+) -> Result<()> {
+    // Collect all database output lines until "!"
+    let mut db_lines: Vec<String> = Vec::new();
     loop {
-        line_count += 1;
-        let mut expected_output_line = String::new();
-        let mut db_in_line = String::new();
+        let mut db_line = String::new();
+        db_in.read_line(&mut db_line).context("Failed to read line from database output")?;
+        let trimmed = db_line.trim().to_string();
+        if trimmed == "!" { break; }
+        if trimmed.is_empty() { continue; }
+        db_lines.push(trimmed);
+    }
 
-        expected_output_reader.read_line(&mut expected_output_line)?;
-        db_in
-            .read_line(&mut db_in_line)
-            .context("Failed to read line from database output")?;
+    // Collect all expected output lines
+    let mut expected_lines: Vec<String> = Vec::new();
+    let mut expected_reader = BufReader::new(File::open(expected_output_file_path)?);
+    loop {
+        let mut line = String::new();
+        expected_reader.read_line(&mut line)?;
+        let trimmed = line.trim().to_string();
+        if trimmed.is_empty() { break; }
+        expected_lines.push(trimmed);
+    }
 
-        if expected_output_line.trim().len() == 0 {
-            if db_in_line.trim() != "!" {
-                bail!("Expected end of output rows '!'\nbut found\n{}", db_in_line);
-            }
-            break;
-        }
+    if sort_before_check {
+        db_lines.sort();
+        expected_lines.sort();
+    }
 
-        if expected_output_line.trim() != db_in_line.trim() {
+    // Compare line by line
+    for (i, (expected, got)) in expected_lines.iter().zip(db_lines.iter()).enumerate() {
+        if expected != got {
             bail!(
-                "Expected line output\n{}\nbut database returned\n{}\nerror at line {line_count}",
-                expected_output_line,
-                db_in_line
+                "Expected line output\n{}\nbut database returned\n{}\nerror at line {}",
+                expected, got, i + 1
             );
         }
+    }
+
+    if expected_lines.len() != db_lines.len() {
+        bail!(
+            "Expected {} rows but database returned {} rows",
+            expected_lines.len(),
+            db_lines.len()
+        );
     }
 
     Ok(())
@@ -155,7 +176,7 @@ fn handle_db(
                 db_out.write_all(format!("{}\n", query_config.memory_limit_mb).as_bytes())?;
             }
             "validate" => {
-                validate(db_in, &query_config.expected_output_file)?;
+                validate(db_in, &query_config.expected_output_file, query_config.sort_before_check)?;
                 return Ok(());
             }
             other => bail!("Unknown command: {other}"),

@@ -525,6 +525,7 @@ fn generate_monitor_config(monitor_generation_config: &MonitorGenerationConfig) 
     let query_config1 = QueryConfig {
         execution_name: String::from("Simple Scan"),
         disabled: true,
+        sort_before_check: true,
         query: QueryOp::scan("TableA").build(),
         expected_output_file: explected_output_1_path,
         memory_limit_mb: 64,
@@ -533,6 +534,7 @@ fn generate_monitor_config(monitor_generation_config: &MonitorGenerationConfig) 
     let query_config2 = QueryConfig {
         execution_name: String::from("Another Simple Scan"),
         disabled: true,
+        sort_before_check: true,
         query: QueryOp::scan("TableB").build(),
         expected_output_file: explected_output_2_path,
         memory_limit_mb: 64,

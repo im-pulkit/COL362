@@ -6,9 +6,9 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize, Serialize)]
 pub struct MonitorConfig {
-    disk_config: DiskConfig,
-    database_config: DatabaseConfig,
-    query_configs: Vec<QueryConfig>,
+    pub disk_config: DiskConfig,
+    pub database_config: DatabaseConfig,
+    pub query_configs: Vec<QueryConfig>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -16,6 +16,8 @@ pub struct QueryConfig {
     pub execution_name: String,
     #[serde(default)]
     pub disabled: bool,
+    #[serde(default)]
+    pub sort_before_check: bool,
     pub query: Query,
     pub expected_output_file: PathBuf,
     pub memory_limit_mb: u64,

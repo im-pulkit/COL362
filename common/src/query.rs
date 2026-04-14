@@ -5,7 +5,7 @@ pub struct Query {
     pub root: QueryOp,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub enum ComparisionOperator {
     EQ,
     NE,

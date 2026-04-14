@@ -1,22 +1,20 @@
 use common::query::{
-    ComparisionOperator, ComparisionValue, MultiProjectBuilder, MultiSortBuilder, QueryOp,
+    ComparisionOperator, ComparisionValue, MultiSortBuilder, MultiProjectBuilder, QueryOp,
 };
 
 fn main() {
-    let query = QueryOp::scan("A")
-        .cross(QueryOp::scan("B"))
+    let query = QueryOp::scan("lineitem")
         .filter(
-            "a1",
-            ComparisionOperator::EQ,
-            ComparisionValue::Column(String::from("b1")),
+            "l_discount",
+            ComparisionOperator::GT,
+            ComparisionValue::F64(0.05),
         )
-        .filter("b3", ComparisionOperator::GTE, ComparisionValue::I32(0))
-        // You also have filter multiple
-        .sort_multiple(MultiSortBuilder::new("a2", true).add("b2", false))
-        .project_multiple(MultiProjectBuilder::new("a1", "id").add("b2", "b2"))
+        .sort_multiple(MultiSortBuilder::new("l_extendedprice", false))
+        .project_multiple(
+            MultiProjectBuilder::new("l_orderkey", "l_orderkey")
+                .add("l_extendedprice", "l_extendedprice")
+        )
         .build();
 
-    let query_json = serde_json::to_string_pretty(&query).unwrap();
-
-    println!("{}", query_json);
+    println!("{}", serde_json::to_string_pretty(&query).unwrap());
 }

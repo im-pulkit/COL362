@@ -1,0 +1,20 @@
+    Finished `release` profile [optimized] target(s) in 1.27s
+     Running `target/release/monitor --config scratch/runtimes/tpch/monitor_config.json`
+--------------------------------------------------------------------------------
+Disk IO metrics DiskIOMetricsResult {
+    total_reads: 0,
+    total_writes: 0,
+    total_blocks_processed: 0,
+    total_cylinders_traveled: 0,
+    total_io_time_us: 0,
+    total_seek_time_us: 0,
+    total_rotational_latency_us: 0,
+    total_transfer_time_us: 0,
+}
+--------------------------------------------------------------------------------
+
+Error: From Monitor
+
+Caused by:
+    0: Validation failed! for Simple Scan
+    1: Program did not validate the result
