@@ -6,3 +6,5 @@
 **/*.bin
 /tests_gen
 /tpch_scratch.tar.gz
+/.git
+.gitignore
