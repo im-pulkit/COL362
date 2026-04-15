@@ -4,3 +4,4 @@
 **/*.csv
 **/*.schema
 **/*.bin
+/tests_gen
