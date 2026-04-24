@@ -1,11 +1,11 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Query {
     pub root: QueryOp,
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 pub enum ComparisionOperator {
     EQ,
     NE,
@@ -15,7 +15,7 @@ pub enum ComparisionOperator {
     LTE,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum ComparisionValue {
     Column(String),
     I32(i32),
@@ -25,47 +25,47 @@ pub enum ComparisionValue {
     String(String),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Predicate {
     pub column_name: String,
     pub operator: ComparisionOperator,
     pub value: ComparisionValue,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct FilterData {
     pub predicates: Vec<Predicate>,
     pub underlying: Box<QueryOp>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ProjectData {
     pub column_name_map: Vec<(String, String)>,
     pub underlying: Box<QueryOp>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct CrossData {
     pub left: Box<QueryOp>,
     pub right: Box<QueryOp>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SortSpec {
     pub column_name: String,
     pub ascending: bool,
 }
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SortData {
     pub sort_specs: Vec<SortSpec>,
     pub underlying: Box<QueryOp>,
 }
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ScanData {
     pub table_id: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum QueryOp {
     Filter(FilterData),
     Project(ProjectData),
