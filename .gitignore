@@ -1,10 +1,10 @@
 /target
-**/*.json
 /scratch
+/tests_gen
+submission.tar.xz
+tpch_scratch.tar.gz
+
+**/*.json
 **/*.csv
 **/*.schema
 **/*.bin
-/tests_gen
-/tpch_scratch.tar.gz
-/.git
-.gitignore
