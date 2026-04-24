@@ -19,9 +19,8 @@ type Row    = Vec<Data>;
 
 // How much RAM we allow for in-memory Sort/Cross before spilling to disk.
 // Keep well under 64MB to leave room for code, stack, buffers.
-const MEMORY_BUDGET_BYTES: usize = 8 * 1024 * 1024; // 8 MB
-const SORT_RUN_BYTES: usize      = 4 * 1024 * 1024; // 8MB — Sort run size
-const BATCH_BLOCKS: u64       = 32; // Number of blocks to read in batch for external sort
+const MEMORY_BUDGET_BYTES: usize = 12 * 1024 * 1024; // 12 MB
+const SORT_RUN_BYTES: usize      = 9 * 1024 * 1024; // 9MB — Sort run size
 
 // ── AnonAllocator ─────────────────────────────────────────────────────────────
 
@@ -112,22 +111,14 @@ fn disk_get_file_num_blocks(o: &mut impl Write, i: &mut impl BufRead, fid: &str)
     disk_cmd_u64(o, i, &format!("get file num-blocks {}\n", fid))
 }
 
-fn disk_read_blocks(
-    o: &mut impl Write, i: &mut impl Read,
-    start_block_id: u64, num_blocks: u64, block_size: u64,
+fn disk_read_block(
+    o: &mut impl Write, i: &mut impl Read, block_id: u64, block_size: u64,
 ) -> Result<Vec<u8>> {
-    o.write_all(format!("get block {} {}\n", start_block_id, num_blocks).as_bytes())?;
+    o.write_all(format!("get block {} 1\n", block_id).as_bytes())?;
     o.flush()?;
-    let mut buf = vec![0u8; (num_blocks * block_size) as usize];
+    let mut buf = vec![0u8; block_size as usize];
     i.read_exact(&mut buf)?;
     Ok(buf)
-}
-
-fn disk_read_block(
-    o: &mut impl Write, i: &mut impl Read,
-    block_id: u64, block_size: u64,
-) -> Result<Vec<u8>> {
-    disk_read_blocks(o, i, block_id, 1, block_size)
 }
 
 // ── Row parsing ───────────────────────────────────────────────────────────────
@@ -349,25 +340,19 @@ fn exec_pipeline(
     let start=disk_get_file_start(disk_out,disk_in,&table.file_id)?;
     let num  =disk_get_file_num_blocks(disk_out,disk_in,&table.file_id)?;
 
-    let mut block_idx = 0u64;
-    while block_idx < num {
-        // Read up to BATCH_BLOCKS at once
-        let batch_size = BATCH_BLOCKS.min(num - block_idx);
-        let raw = disk_read_blocks(disk_out, disk_in, start + block_idx, batch_size, block_size)?;
+    for i in 0..num {
+        let block=disk_read_block(disk_out,disk_in,start+i,block_size)?;
+        for row in parse_block(&block,&col_types) {
+            // Apply pre-projection filters against raw schema
+            if !passes_all_filters(&row,&base_schema,&pre_filters) { continue; }
 
-        for b in 0..batch_size {
-            let offset = (b * block_size) as usize;
-            let block  = &raw[offset..offset + block_size as usize];
+            let final_row=apply_project_chain(row,&base_schema,&pipeline.projects);
 
-            for row in parse_block(block, &col_types) {
-                if !passes_all_filters(&row, &base_schema, &pre_filters) { continue; }
-                let final_row = apply_project_chain(row, &base_schema, &pipeline.projects);
-                if !passes_all_filters(&final_row, &out_schema, &post_filters) { continue; }
-                emit(final_row, &out_schema)?;
-            }
+            // Apply post-projection filters against output schema
+            if !passes_all_filters(&final_row,&out_schema,&post_filters) { continue; }
+
+            emit(final_row,&out_schema)?;
         }
-
-        block_idx += batch_size;
     }
     Ok(out_schema)
 }
@@ -877,21 +862,14 @@ fn spill_pipeline_to_anon(
 
     let anon_start = allocator.next;
     let mut writer = BlockWriter::new(block_size, anon_start);
-    let mut block_idx = 0u64;
-    while block_idx < file_num {
-        let batch_size = BATCH_BLOCKS.min(file_num - block_idx);
-        let raw = disk_read_blocks(disk_out, disk_in, file_start + block_idx, batch_size, block_size)?;
-        for b in 0..batch_size {
-            let offset = (b * block_size) as usize;
-            let block  = &raw[offset..offset + block_size as usize];
-            for row in parse_block(block, &col_types) {
-                if !passes_all_filters(&row, &base_schema, &pre_filters) { continue; }
-                let final_row = apply_project_chain(row, &base_schema, &pipeline.projects);
-                if !passes_all_filters(&final_row, &out_schema, &post_filters) { continue; }
-                writer.push(&final_row, disk_out)?;
-            }
+    for i in 0..file_num {
+        let block = disk_read_block(disk_out, disk_in, file_start + i, block_size)?;
+        for row in parse_block(&block, &col_types) {
+            if !passes_all_filters(&row, &base_schema, &pre_filters) { continue; }
+            let final_row = apply_project_chain(row, &base_schema, &pipeline.projects);
+            if !passes_all_filters(&final_row, &out_schema, &post_filters) { continue; }
+            writer.push(&final_row, disk_out)?;
         }
-        block_idx += batch_size;
     }
     let (sb, nb) = writer.finish(disk_out)?;
     allocator.next = anon_start + nb;
@@ -1376,27 +1354,17 @@ fn partition_pipeline(
     let start = disk_get_file_start(disk_out, disk_in, &table.file_id)?;
     let num   = disk_get_file_num_blocks(disk_out, disk_in, &table.file_id)?;
 
-    let mut block_idx = 0u64;
-    while block_idx < num {
-        // Read up to BATCH_BLOCKS at once
-        let batch_size = BATCH_BLOCKS.min(num - block_idx);
-        let raw = disk_read_blocks(disk_out, disk_in, start + block_idx, batch_size, block_size)?;
-
-        for b in 0..batch_size {
-            let offset = (b * block_size) as usize;
-            let block  = &raw[offset..offset + block_size as usize];
-
-            for row in parse_block(block, &col_types) {
-                if !passes_all_filters(&row, &base_schema, &pre_filters) { continue; }
-                let final_row = apply_project_chain(row, &base_schema, &pipeline.projects);
-                if !passes_all_filters(&final_row, &out_schema, &post_filters) { continue; }
-                let key = extract_key(&final_row, &out_schema, equi_pairs, is_left);
-                let p = hash_key(&key);
-                writers[p].push(&final_row, disk_out)?;
-            }
+    for i in 0..num {
+        let block = disk_read_block(disk_out, disk_in, start + i, block_size)?;
+        for row in parse_block(&block, &col_types) {
+            if !passes_all_filters(&row, &base_schema, &pre_filters) { continue; }
+            let final_row = apply_project_chain(row, &base_schema, &pipeline.projects);
+            if !passes_all_filters(&final_row, &out_schema, &post_filters) { continue; }
+            let key = extract_key(&final_row, &out_schema, equi_pairs, is_left);
+            let p = hash_key(&key);
+            // Write to partition writer — disk_out used sequentially, no borrow conflict
+            writers[p].push(&final_row, disk_out)?;
         }
-
-        block_idx += batch_size;
     }
     Ok(())
 }
@@ -1488,10 +1456,12 @@ fn exec_sort(
     emit:       &mut dyn FnMut(Row, &Schema) -> Result<()>,
 ) -> Result<Schema> {
     if let Some(pipeline) = try_flatten(&sort_data.underlying) {
+        eprintln!("[SORT] using pipeline path for {}", pipeline.scan.table_id);
         return exec_sort_from_pipeline(
             &pipeline, sort_data, ctx, disk_out, disk_in, block_size, allocator, emit
         );
     }
+    eprintln!("[SORT] using slow path");
 
     let (child_start, child_num, child_schema) =
         spill_hash_join_to_anon_generic(
@@ -1588,39 +1558,48 @@ fn exec_sort_from_pipeline(
     let mut runs: Vec<(u64, u64)> = Vec::new();
     let mut batch: Vec<Row> = Vec::new();
     let mut batch_bytes: usize = 0;
+    let mut total_rows: usize = 0;
 
-    // Read one block at a time, accumulate into batch, spill when full
-    let mut block_idx = 0u64;
-    while block_idx < num {
-        // Read up to BATCH_BLOCKS at once
-        let batch_size = BATCH_BLOCKS.min(num - block_idx);
-        let raw = disk_read_blocks(disk_out, disk_in, start + block_idx, batch_size, block_size)?;
+    for i in 0..num {
+        let block = disk_read_block(disk_out, disk_in, start + i, block_size)?;
+        for row in parse_block(&block, &col_types) {
+            if !passes_all_filters(&row, &base_schema, &pre_filters) { continue; }
+            let final_row = apply_project_chain(row, &base_schema, &pipeline.projects);
+            if !passes_all_filters(&final_row, &out_schema, &post_filters) { continue; }
 
-        for b in 0..batch_size {
-            let offset = (b * block_size) as usize;
-            let block  = &raw[offset..offset + block_size as usize];
+            // Debug first row
+            if total_rows == 0 {
+                eprintln!("[SORT_DEBUG] first row size estimate: {}, cols: {}",
+                    serialize_row_bytes(&final_row).len(), final_row.len());
+                eprintln!("[SORT_DEBUG] SORT_RUN_BYTES={}", SORT_RUN_BYTES);
+            }
 
-            for row in parse_block(block, &col_types) {
-                if !passes_all_filters(&row, &base_schema, &pre_filters) { continue; }
-                let final_row = apply_project_chain(row, &base_schema, &pipeline.projects);
-                if !passes_all_filters(&final_row, &out_schema, &post_filters) { continue; }
-                emit(final_row, &out_schema)?;
+            batch_bytes += serialize_row_bytes(&final_row).len();
+            batch.push(final_row);
+            total_rows += 1;
+
+            if batch_bytes > SORT_RUN_BYTES {
+                eprintln!("[SORT_DEBUG] spilling run at row {}, batch_bytes={}",
+                    total_rows, batch_bytes);
+                batch.sort_by(|a, b|
+                    compare_rows(a, b, &out_schema, &sort_data.sort_specs));
+                let (rs, rn) = spill_rows_to_anon(&batch, disk_out, block_size, allocator)?;
+                if rn > 0 { runs.push((rs, rn)); }
+                batch.clear();
+                batch_bytes = 0;
             }
         }
-
-        block_idx += batch_size;
     }
 
-    // Handle remaining rows
+    eprintln!("[SORT_DEBUG] total_rows={} runs={}", total_rows, runs.len());
+
     if runs.is_empty() {
-        // Everything fit in memory — sort and emit directly, zero disk I/O
         batch.sort_by(|a, b|
             compare_rows(a, b, &out_schema, &sort_data.sort_specs));
         for row in batch { emit(row, &out_schema)?; }
         return Ok(out_schema);
     }
 
-    // Spill final batch
     if !batch.is_empty() {
         batch.sort_by(|a, b|
             compare_rows(a, b, &out_schema, &sort_data.sort_specs));
@@ -1628,7 +1607,6 @@ fn exec_sort_from_pipeline(
         if rn > 0 { runs.push((rs, rn)); }
     }
 
-    // K-way merge
     merge_runs(runs, &out_schema, sort_data, disk_out, disk_in, block_size, emit)?;
     Ok(out_schema)
 }
