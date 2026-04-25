@@ -1938,6 +1938,16 @@ fn build_incremental_join(
 
     current
 }
+fn collect_stacked_filters(op: QueryOp) -> (Vec<common::query::Predicate>, QueryOp) {
+    match op {
+        QueryOp::Filter(f) => {
+            let (mut preds, underlying) = collect_stacked_filters(*f.underlying);
+            preds.extend(f.predicates);
+            (preds, underlying)
+        }
+        other => (vec![], other),
+    }
+}
 
 fn reorder_joins(op: QueryOp, ctx: &DbContext) -> QueryOp {
     match op {
@@ -1949,54 +1959,65 @@ fn reorder_joins(op: QueryOp, ctx: &DbContext) -> QueryOp {
             underlying: Box::new(reorder_joins(*p.underlying, ctx)),
             column_name_map: p.column_name_map,
         }),
-        QueryOp::Filter(f) if matches!(f.underlying.as_ref(), QueryOp::Cross(_)) => {
-            let tables = flatten_cross_tree_owned(*f.underlying);
-            // eprintln!("[REORDER] {} tables detected", tables.len());
-            if tables.len() <= 2 {
-                let cross = tables.into_iter().reduce(|l, r| {
-                    QueryOp::Cross(CrossData { left: Box::new(l), right: Box::new(r) })
-                }).unwrap();
-                return QueryOp::Filter(FilterData {
-                    predicates: f.predicates,
-                    underlying: Box::new(cross),
-                });
+        QueryOp::Filter(f) => {
+            // Collect ALL stacked filter predicates to see what's underneath
+            let mut all_preds = f.predicates;
+            let (more_preds, underlying) = collect_stacked_filters(*f.underlying);
+            all_preds.extend(more_preds);
+
+            if matches!(&underlying, QueryOp::Cross(_)) {
+                let tables = flatten_cross_tree_owned(underlying);
+                if tables.len() <= 2 {
+                    let cross = tables.into_iter().reduce(|l, r| {
+                        QueryOp::Cross(CrossData { left: Box::new(l), right: Box::new(r) })
+                    }).unwrap();
+                    return if all_preds.is_empty() { cross }
+                    else { QueryOp::Filter(FilterData {
+                        predicates: all_preds, underlying: Box::new(cross),
+                    })};
+                }
+                return build_incremental_join(tables, all_preds, ctx);
             }
-            build_incremental_join(tables, f.predicates, ctx)
+
+            // Not a Cross underneath — just recurse
+            let new_underlying = reorder_joins(underlying, ctx);
+            if all_preds.is_empty() { new_underlying }
+            else { QueryOp::Filter(FilterData {
+                predicates: all_preds,
+                underlying: Box::new(new_underlying),
+            })}
         }
-        QueryOp::Filter(f) => QueryOp::Filter(FilterData {
-            predicates: f.predicates,
-            underlying: Box::new(reorder_joins(*f.underlying, ctx)),
-        }),
         other => other,
     }
 }
 
 fn optimize(op: QueryOp, ctx: &DbContext) -> QueryOp {
-    // Step 1: recursively optimize children
+    // Step 1: reorder joins on raw tree BEFORE pushing predicates down
     let op = reorder_joins(op, ctx);
+    // Step 2: push predicates down on reordered tree
+    push_down_pass(op, ctx)
+}
 
+fn push_down_pass(op: QueryOp, ctx: &DbContext) -> QueryOp {
     match op {
         QueryOp::Filter(f) => {
-            let c = optimize(*f.underlying, ctx);
+            let c = push_down_pass(*f.underlying, ctx);
             push_filter_down(f.predicates, c, ctx)
         }
         QueryOp::Sort(s) => QueryOp::Sort(SortData {
-            underlying: Box::new(optimize(*s.underlying, ctx)),
+            underlying: Box::new(push_down_pass(*s.underlying, ctx)),
             sort_specs: s.sort_specs,
         }),
         QueryOp::Project(p) => QueryOp::Project(ProjectData {
-            underlying: Box::new(optimize(*p.underlying, ctx)),
+            underlying: Box::new(push_down_pass(*p.underlying, ctx)),
             column_name_map: p.column_name_map,
         }),
         QueryOp::Cross(c) => QueryOp::Cross(CrossData {
-            left:  Box::new(optimize(*c.left, ctx)),
-            right: Box::new(optimize(*c.right, ctx)),
+            left:  Box::new(push_down_pass(*c.left, ctx)),
+            right: Box::new(push_down_pass(*c.right, ctx)),
         }),
         QueryOp::Scan(_) => op,
     }
-
-    // Step 2: reorder multi-way joins after pushdown
-    
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
