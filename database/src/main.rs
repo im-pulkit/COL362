@@ -587,9 +587,6 @@ fn exec_sort_merge_join(
             }
         }
     }
-    // // eprintln!("[GRACE] partitioning left={} right={}",
-    // get_scan_table_name(&cross_data.left).unwrap_or("complex".into()),
-    // get_scan_table_name(&cross_data.right).unwrap_or("complex".into()));
 
     Ok(combined_schema)
 }
@@ -890,9 +887,6 @@ fn spill_sort_merge_join_to_anon(
     block_size:    u64,
     allocator:     &mut AnonAllocator,
 ) -> Result<(u64, u64, Schema)> {
-    // eprintln!("[SPILL_SMJ] left={} right={}",
-    // get_scan_table_name(&cross_data.left).unwrap_or_else(|| "complex".into()),
-    // get_scan_table_name(&cross_data.right).unwrap_or_else(|| "complex".into()));
     let left_pipeline  = try_flatten(&cross_data.left)
         .expect("sort-merge spill: left must be pipeline");
     let right_pipeline = try_flatten(&cross_data.right)
@@ -1029,9 +1023,6 @@ fn exec_grace_hash_join(
             }
         }
     }
-    // eprintln!("[GRACE] partitioning left={} right={}",
-    // get_scan_table_name(&cross_data.left).unwrap_or("complex".into()),
-    // get_scan_table_name(&cross_data.right).unwrap_or("complex".into()));
 
     Ok(combined_schema)
 }
@@ -1046,9 +1037,6 @@ fn spill_grace_hash_join_to_anon(
     block_size:       u64,
     allocator:        &mut AnonAllocator,
 ) -> Result<(u64, u64, Schema)> {
-    // eprintln!("[SPILL_GRACE] left={} right={}",
-    // get_scan_table_name(&cross_data.left).unwrap_or_else(|| "complex".into()),
-    // get_scan_table_name(&cross_data.right).unwrap_or_else(|| "complex".into()));
     let (left_schema, right_schema, combined_schema, equi_pairs, theta) =
         prepare_join_metadata(cross_data, join_predicates, ctx);
 
@@ -1266,21 +1254,18 @@ fn partition_op(
 
     // General case: spill op to anon disk first, then read back and partition
     // This avoids holding large intermediate results in RAM
-    // General case: collect then partition (safe for small complex ops)
-    let mut rows: Vec<Row> = Vec::new();
-    let mut schema_out: Option<Schema> = None;
-    let child_schema = execute(op, ctx, disk_out, disk_in, block_size, allocator,
-        &mut |row, schema| {
-            if schema_out.is_none() { schema_out = Some(schema.clone()); }
-            rows.push(row);
-            Ok(())
-        })?;
-    let actual_schema = schema_out.unwrap_or(child_schema);
-    // eprintln!("[PARTITION_FALLBACK] collected {} rows from complex op", rows.len());
-    for row in &rows {
-        let key = extract_key(row, &actual_schema, equi_pairs, is_left);
-        let p = hash_key(&key);
-        writers[p].push(row, disk_out)?;
+    let (spill_start, spill_num, spill_schema) =
+        spill_hash_join_to_anon_generic(op, ctx, disk_out, disk_in, block_size, allocator)?;
+
+    let col_types: Vec<DataType> = spill_schema.iter().map(|(_, t)| t.clone()).collect();
+
+    for i in 0..spill_num {
+        let block = disk_read_block(disk_out, disk_in, spill_start + i, block_size)?;
+        for row in parse_block(&block, &col_types) {
+            let key = extract_key(&row, &spill_schema, equi_pairs, is_left);
+            let p = hash_key(&key);
+            writers[p].push(&row, disk_out)?;
+        }
     }
     Ok(())
 }
@@ -1384,108 +1369,6 @@ fn partition_pipeline(
     Ok(())
 }
 
-fn grace_hash_join_from_blocks(
-    left_start:  u64, left_num:  u64, left_schema:  &Schema,
-    right_start: u64, right_num: u64, right_schema: &Schema,
-    equi_pairs:  &[(String, String)],
-    theta:       &[&common::query::Predicate],
-    combined_schema: &Schema,
-    disk_out:    &mut impl Write,
-    disk_in:     &mut (impl BufRead + Read),
-    block_size:  u64,
-    allocator:   &mut AnonAllocator,
-) -> Result<(u64, u64, Schema)> {
-    let left_col_types:  Vec<DataType> = left_schema.iter().map(|(_,t)| t.clone()).collect();
-    let right_col_types: Vec<DataType> = right_schema.iter().map(|(_,t)| t.clone()).collect();
-
-    // Partition left into NUM_PARTITIONS buckets
-    let left_part_starts: Vec<u64> = (0..NUM_PARTITIONS)
-        .map(|_| { let s = allocator.next; allocator.next += 512; s })
-        .collect();
-    let mut left_writers: Vec<BlockWriter> = left_part_starts.iter()
-        .map(|&s| BlockWriter::new(block_size, s)).collect();
-
-    for i in 0..left_num {
-        let block = disk_read_block(disk_out, disk_in, left_start + i, block_size)?;
-        for row in parse_block(&block, &left_col_types) {
-            let key: Vec<String> = equi_pairs.iter()
-                .map(|(lc, _)| format_value(&row[col_idx(left_schema, lc)])).collect();
-            let p = hash_key(&key);
-            left_writers[p].push(&row, disk_out)?;
-        }
-    }
-    let mut left_parts: Vec<(u64, u64)> = Vec::new();
-    for (i, w) in left_writers.into_iter().enumerate() {
-        let (sb, nb) = w.finish(disk_out)?;
-        left_parts.push((sb, nb));
-        if nb > 0 { allocator.next = allocator.next.max(left_part_starts[i] + nb); }
-    }
-
-    // Partition right
-    let right_part_starts: Vec<u64> = (0..NUM_PARTITIONS)
-        .map(|_| { let s = allocator.next; allocator.next += 512; s })
-        .collect();
-    let mut right_writers: Vec<BlockWriter> = right_part_starts.iter()
-        .map(|&s| BlockWriter::new(block_size, s)).collect();
-
-    for i in 0..right_num {
-        let block = disk_read_block(disk_out, disk_in, right_start + i, block_size)?;
-        for row in parse_block(&block, &right_col_types) {
-            let key: Vec<String> = equi_pairs.iter()
-                .map(|(_, rc)| format_value(&row[col_idx(right_schema, rc)])).collect();
-            let p = hash_key(&key);
-            right_writers[p].push(&row, disk_out)?;
-        }
-    }
-    let mut right_parts: Vec<(u64, u64)> = Vec::new();
-    for (i, w) in right_writers.into_iter().enumerate() {
-        let (sb, nb) = w.finish(disk_out)?;
-        right_parts.push((sb, nb));
-        if nb > 0 { allocator.next = allocator.next.max(right_part_starts[i] + nb); }
-    }
-
-    // Join each partition pair
-    let out_start = allocator.next;
-    let mut out_writer = BlockWriter::new(block_size, out_start);
-
-    for p in 0..NUM_PARTITIONS {
-        let (ls, ln) = left_parts[p];
-        let (rs, rn) = right_parts[p];
-        if ln == 0 || rn == 0 { continue; }
-
-        use std::collections::HashMap;
-        let mut hash_table: HashMap<Vec<String>, Vec<Row>> = HashMap::new();
-        for i in 0..ln {
-            let block = disk_read_block(disk_out, disk_in, ls + i, block_size)?;
-            for row in parse_block(&block, &left_col_types) {
-                let key: Vec<String> = equi_pairs.iter()
-                    .map(|(lc, _)| format_value(&row[col_idx(left_schema, lc)])).collect();
-                hash_table.entry(key).or_default().push(row);
-            }
-        }
-        for i in 0..rn {
-            let block = disk_read_block(disk_out, disk_in, rs + i, block_size)?;
-            for right_row in parse_block(&block, &right_col_types) {
-                let key: Vec<String> = equi_pairs.iter()
-                    .map(|(_, rc)| format_value(&right_row[col_idx(right_schema, rc)])).collect();
-                if let Some(left_rows) = hash_table.get(&key) {
-                    for left_row in left_rows {
-                        let mut combined = left_row.clone();
-                        combined.extend_from_slice(&right_row);
-                        if theta.iter().all(|p| eval_predicate(&combined, combined_schema, p)) {
-                            out_writer.push_bytes(&serialize_row_bytes(&combined), disk_out)?;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    let (sb, nb) = out_writer.finish(disk_out)?;
-    allocator.next = out_start + nb;
-    Ok((sb, nb, combined_schema.clone()))
-}
-
 // Generic spill for any op — used for nested Cross children
 fn spill_hash_join_to_anon_generic(
     op:         &QueryOp,
@@ -1495,165 +1378,56 @@ fn spill_hash_join_to_anon_generic(
     block_size: u64,
     allocator:  &mut AnonAllocator,
 ) -> Result<(u64, u64, Schema)> {
-    // Fast path: pipeline
     if let Some(pipe) = try_flatten(op) {
         return spill_pipeline_to_anon(&pipe, ctx, disk_out, disk_in, block_size, allocator);
     }
+    if let QueryOp::Filter(f) = op {
+        if let QueryOp::Cross(c) = f.underlying.as_ref() {
+            // Check sort-merge first
+            let equi_pairs: Vec<(String,String)> = f.predicates.iter()
+                .filter_map(|p| {
+                    if p.operator != ComparisionOperator::EQ { return None; }
+                    let ComparisionValue::Column(other) = &p.value else { return None; };
+                    let ls = schema_of(&c.left, ctx);
+                    let rs = schema_of(&c.right, ctx);
+                    let lhs_left = ls.iter().any(|(n,_)| n == &p.column_name);
+                    let rhs_right = rs.iter().any(|(n,_)| n == other.as_str());
+                    if lhs_left && rhs_right { Some((p.column_name.clone(), other.clone())) }
+                    else { None }
+                }).collect();
 
-    // Get cross data and predicates
-    let (cross_data, join_preds): (&CrossData, &[common::query::Predicate]) = match op {
-        QueryOp::Filter(f) if matches!(f.underlying.as_ref(), QueryOp::Cross(_)) => {
-            if let QueryOp::Cross(c) = f.underlying.as_ref() { (c, &f.predicates) }
-            else { unreachable!() }
-        }
-        QueryOp::Cross(c) => (c, &[]),
-        _ => {
-            // Non-join op: just collect and spill
-            return collect_and_spill(op, ctx, disk_out, disk_in, block_size, allocator);
-        }
-    };
+            if equi_pairs.len() == 1 {
+                let lt = get_scan_table_name(&c.left);
+                let rt = get_scan_table_name(&c.right);
+                let lp = try_flatten(&c.left).is_some();
+                let rp = try_flatten(&c.right).is_some();
+                if lp && rp &&
+                    lt.as_ref().map_or(false, |t| is_physically_ordered(&equi_pairs[0].0, t, ctx)) &&
+                    rt.as_ref().map_or(false, |t| is_physically_ordered(&equi_pairs[0].1, t, ctx))
+                {
+                    return spill_sort_merge_join_to_anon(
+                        c, &equi_pairs[0].0, &equi_pairs[0].1,
+                        &f.predicates.iter()
+                            .filter(|p| !matches!(&p.value, ComparisionValue::Column(_)))
+                            .collect::<Vec<_>>(),
+                        ctx, disk_out, disk_in, block_size, allocator,
+                    );
+                }
+            }
 
-    // Check sort-merge opportunity
-    let equi_pairs = extract_equi_pairs(cross_data, join_preds, ctx);
-    if equi_pairs.len() == 1 {
-        let lt = get_scan_table_name(&cross_data.left);
-        let rt = get_scan_table_name(&cross_data.right);
-        if try_flatten(&cross_data.left).is_some() && try_flatten(&cross_data.right).is_some() &&
-            lt.as_ref().map_or(false, |t| is_physically_ordered(&equi_pairs[0].0, t, ctx)) &&
-            rt.as_ref().map_or(false, |t| is_physically_ordered(&equi_pairs[0].1, t, ctx))
-        {
-            let theta: Vec<&common::query::Predicate> = join_preds.iter()
-    .filter(|p| {
-        // Only exclude if it's an EQ Column=Column predicate (already in equi_pairs)
-        !(p.operator == ComparisionOperator::EQ 
-          && matches!(&p.value, ComparisionValue::Column(_)))
-    }).collect();
-            return spill_sort_merge_join_to_anon(
-                cross_data, &equi_pairs[0].0, &equi_pairs[0].1,
-                &theta, ctx, disk_out, disk_in, block_size, allocator,
+            return spill_grace_hash_join_to_anon(
+                c, &f.predicates,
+                ctx, disk_out, disk_in, block_size, allocator,
             );
         }
     }
-
-    // RAM hash join — spill both sides first, then join
-    // Step 1: spill left side (recursive — handles nested joins)
-    let (left_start, left_num, left_schema) =
-        spill_hash_join_to_anon_generic(&cross_data.left, ctx, disk_out, disk_in, block_size, allocator)?;
-
-    // Step 2: spill right side
-    let (right_start, right_num, right_schema) =
-        spill_hash_join_to_anon_generic(&cross_data.right, ctx, disk_out, disk_in, block_size, allocator)?;
-
-    // Step 3: build hash table from smaller side
-    let left_blocks  = left_num;
-    let right_blocks = right_num;
-    // eprintln!("[HASH_JOIN] left_blocks={} right_blocks={}", left_blocks, right_blocks);
-
-    let build_from_right = right_blocks <= left_blocks;
-    let theta: Vec<&common::query::Predicate> = join_preds.iter()
-    .filter(|p| {
-        // Only exclude if it's an EQ Column=Column predicate (already in equi_pairs)
-        !(p.operator == ComparisionOperator::EQ 
-          && matches!(&p.value, ComparisionValue::Column(_)))
-    }).collect();
-
-    let combined_schema: Schema = if build_from_right {
-        left_schema.iter().chain(right_schema.iter()).cloned().collect()
-    } else {
-        left_schema.iter().chain(right_schema.iter()).cloned().collect()
-    };
-
-    // If smaller side > 200 blocks (~800KB serialized = several MB Rust objects), use grace
-    let smaller_blocks = left_blocks.min(right_blocks);
-    if smaller_blocks > 200 {
-        // eprintln!("[HASH_JOIN] too large for RAM hash, using grace hash on spilled data");
-        // Grace hash join on already-spilled blocks
-        return grace_hash_join_from_blocks(
-            left_start, left_num, &left_schema,
-            right_start, right_num, &right_schema,
-            &equi_pairs, &theta, &combined_schema,
-            disk_out, disk_in, block_size, allocator,
+    if let QueryOp::Cross(c) = op {
+        return spill_grace_hash_join_to_anon(
+            c, &[], ctx, disk_out, disk_in, block_size, allocator,
         );
     }
-
-    
-
-    let (build_start, build_num, build_schema, probe_start, probe_num, probe_schema) =
-        if build_from_right {
-            (right_start, right_num, right_schema, left_start, left_num, left_schema)
-        } else {
-            (left_start, left_num, left_schema, right_start, right_num, right_schema)
-        };
-
-    let build_col_types: Vec<DataType> = build_schema.iter().map(|(_,t)| t.clone()).collect();
-    let probe_col_types: Vec<DataType> = probe_schema.iter().map(|(_,t)| t.clone()).collect();
-
-    // Build hash table
-    use std::collections::HashMap;
-    let mut hash_table: HashMap<Vec<String>, Vec<Row>> = HashMap::new();
-    for i in 0..build_num {
-        let block = disk_read_block(disk_out, disk_in, build_start + i, block_size)?;
-        for row in parse_block(&block, &build_col_types) {
-            let key: Vec<String> = equi_pairs.iter().map(|(lc, rc)| {
-                let col = if build_from_right { rc } else { lc };
-                let idx = build_schema.iter().position(|(n,_)| n == col)
-                    .unwrap_or_else(|| panic!("col {} not found", col));
-                format_value(&row[idx])
-            }).collect();
-            hash_table.entry(key).or_default().push(row);
-        }
-    }
-
-    // let theta: Vec<&common::query::Predicate> = join_preds.iter()
-    //     .filter(|p| !matches!(&p.value, ComparisionValue::Column(_))).collect();
-
-    // let combined_schema: Schema = if build_from_right {
-    //     probe_schema.iter().chain(build_schema.iter()).cloned().collect()
-    // } else {
-    //     build_schema.iter().chain(probe_schema.iter()).cloned().collect()
-    // };
-
-    // Probe and write results
-    let out_start = allocator.next;
-    let mut writer = BlockWriter::new(block_size, out_start);
-
-    for i in 0..probe_num {
-        let block = disk_read_block(disk_out, disk_in, probe_start + i, block_size)?;
-        for probe_row in parse_block(&block, &probe_col_types) {
-            let key: Vec<String> = equi_pairs.iter().map(|(lc, rc)| {
-                let col = if build_from_right { lc } else { rc };
-                let idx = probe_schema.iter().position(|(n,_)| n == col)
-                    .unwrap_or_else(|| panic!("col {} not found", col));
-                format_value(&probe_row[idx])
-            }).collect();
-            if let Some(build_rows) = hash_table.get(&key) {
-                for build_row in build_rows {
-                    let combined: Row = if build_from_right {
-                        let mut c = probe_row.clone(); c.extend_from_slice(build_row); c
-                    } else {
-                        let mut c = build_row.clone(); c.extend_from_slice(&probe_row); c
-                    };
-                    if theta.iter().all(|p| eval_predicate(&combined, &combined_schema, p)) {
-                        writer.push_bytes(&serialize_row_bytes(&combined), disk_out)?;
-                    }
-                }
-            }
-        }
-    }
-
-    let (sb, nb) = writer.finish(disk_out)?;
-    allocator.next = out_start + nb;
-    Ok((sb, nb, combined_schema))
-}
-
-fn collect_and_spill(
-    op:         &QueryOp,
-    ctx:        &DbContext,
-    disk_out:   &mut impl Write,
-    disk_in:    &mut (impl BufRead + Read),
-    block_size: u64,
-    allocator:  &mut AnonAllocator,
-) -> Result<(u64, u64, Schema)> {
+    // Fallback for small results
+    eprintln!("[SPILL_GENERIC] collecting rows for fallback...");
     let mut rows: Vec<Row> = Vec::new();
     let mut schema_out: Option<Schema> = None;
     let child_schema = execute(op, ctx, disk_out, disk_in, block_size, allocator,
@@ -1662,6 +1436,7 @@ fn collect_and_spill(
             rows.push(row);
             Ok(())
         })?;
+    eprintln!("[SPILL_GENERIC] collected {} rows", rows.len());
     let schema = schema_out.unwrap_or(child_schema);
     let start = allocator.next;
     let mut writer = BlockWriter::new(block_size, start);
@@ -1669,26 +1444,6 @@ fn collect_and_spill(
     let (sb, nb) = writer.finish(disk_out)?;
     allocator.next = start + nb;
     Ok((sb, nb, schema))
-}
-
-fn extract_equi_pairs(
-    cross_data:  &CrossData,
-    join_preds:  &[common::query::Predicate],
-    ctx:         &DbContext,
-) -> Vec<(String, String)> {
-    let left_schema  = schema_of(&cross_data.left, ctx);
-    let right_schema = schema_of(&cross_data.right, ctx);
-    join_preds.iter().filter_map(|p| {
-        if p.operator != ComparisionOperator::EQ { return None; }
-        let ComparisionValue::Column(other) = &p.value else { return None; };
-        let lhs_left  = left_schema.iter().any(|(n,_)| n == &p.column_name);
-        let rhs_right = right_schema.iter().any(|(n,_)| n == other.as_str());
-        let lhs_right = right_schema.iter().any(|(n,_)| n == &p.column_name);
-        let rhs_left  = left_schema.iter().any(|(n,_)| n == other.as_str());
-        if lhs_left && rhs_right { Some((p.column_name.clone(), other.clone())) }
-        else if lhs_right && rhs_left { Some((other.clone(), p.column_name.clone())) }
-        else { None }
-    }).collect()
 }
 
 fn exec_sort(
@@ -1701,12 +1456,12 @@ fn exec_sort(
     emit:       &mut dyn FnMut(Row, &Schema) -> Result<()>,
 ) -> Result<Schema> {
     if let Some(pipeline) = try_flatten(&sort_data.underlying) {
-        // eprintln!("[SORT] using pipeline path for {}", pipeline.scan.table_id);
+        eprintln!("[SORT] using pipeline path for {}", pipeline.scan.table_id);
         return exec_sort_from_pipeline(
             &pipeline, sort_data, ctx, disk_out, disk_in, block_size, allocator, emit
         );
     }
-    // eprintln!("[SORT] using slow path");
+    eprintln!("[SORT] using slow path");
 
     let (child_start, child_num, child_schema) =
         spill_hash_join_to_anon_generic(
@@ -1813,19 +1568,19 @@ fn exec_sort_from_pipeline(
             if !passes_all_filters(&final_row, &out_schema, &post_filters) { continue; }
 
             // Debug first row
-            // if total_rows == 0 {
-            //     eprintln!("[SORT_DEBUG] first row size estimate: {}, cols: {}",
-            //         serialize_row_bytes(&final_row).len(), final_row.len());
-            //     // eprintln!("[SORT_DEBUG] SORT_RUN_BYTES={}", SORT_RUN_BYTES);
-            // }
+            if total_rows == 0 {
+                eprintln!("[SORT_DEBUG] first row size estimate: {}, cols: {}",
+                    serialize_row_bytes(&final_row).len(), final_row.len());
+                eprintln!("[SORT_DEBUG] SORT_RUN_BYTES={}", SORT_RUN_BYTES);
+            }
 
             batch_bytes += serialize_row_bytes(&final_row).len();
             batch.push(final_row);
             total_rows += 1;
 
             if batch_bytes > SORT_RUN_BYTES {
-                // eprintln!("[SORT_DEBUG] spilling run at row {}, batch_bytes={}",
-                //     total_rows, batch_bytes);
+                eprintln!("[SORT_DEBUG] spilling run at row {}, batch_bytes={}",
+                    total_rows, batch_bytes);
                 batch.sort_by(|a, b|
                     compare_rows(a, b, &out_schema, &sort_data.sort_specs));
                 let (rs, rn) = spill_rows_to_anon(&batch, disk_out, block_size, allocator)?;
@@ -1836,7 +1591,7 @@ fn exec_sort_from_pipeline(
         }
     }
 
-    // eprintln!("[SORT_DEBUG] total_rows={} runs={}", total_rows, runs.len());
+    eprintln!("[SORT_DEBUG] total_rows={} runs={}", total_rows, runs.len());
 
     if runs.is_empty() {
         batch.sort_by(|a, b|
@@ -2067,45 +1822,26 @@ fn push_filter_down(
     }
 }
 
+/// Flatten a nested Cross tree into a list of leaf ops
+// fn flatten_cross_tree(op: &QueryOp) -> Vec<&QueryOp> {
+//     match op {
+//         QueryOp::Cross(c) => {
+//             let mut left = flatten_cross_tree(&c.left);
+//             left.extend(flatten_cross_tree(&c.right));
+//             left
+//         }
+//         other => vec![other],
+//     }
+// }
 
-/// Extract ALL predicates and ALL leaf tables from a Filter/Cross tree.
-/// Predicates pushed anywhere in the tree get pulled back up.
-fn extract_all(op: QueryOp) -> (Vec<QueryOp>, Vec<common::query::Predicate>) {
-    let op_type = match &op {
-        QueryOp::Cross(_)   => "Cross".to_string(),
-        QueryOp::Filter(_)  => "Filter".to_string(),
-        QueryOp::Scan(s)    => format!("Scan({})", s.table_id),
-        QueryOp::Sort(_)    => "Sort".to_string(),
-        QueryOp::Project(_) => "Project".to_string(),
-    };
-    // eprintln!("[EXTRACT] op type: {}", op_type);
+fn flatten_cross_tree_owned(op: QueryOp) -> Vec<QueryOp> {
     match op {
         QueryOp::Cross(c) => {
-            let (mut lt, mut lp) = extract_all(*c.left);
-            let (rt, rp) = extract_all(*c.right);
-            lt.extend(rt); lp.extend(rp);
-            (lt, lp)
+            let mut left = flatten_cross_tree_owned(*c.left);
+            left.extend(flatten_cross_tree_owned(*c.right));
+            left
         }
-        QueryOp::Filter(f) => {
-            let (cross_preds, local_preds): (Vec<_>, Vec<_>) =
-                f.predicates.into_iter().partition(|p| {
-                    matches!(&p.value, ComparisionValue::Column(_))
-                });
-            let (tables, mut lifted) = extract_all(*f.underlying);
-            lifted.extend(cross_preds);
-            let tables_with_filter = if local_preds.is_empty() {
-                tables
-            } else {
-                tables.into_iter().map(|t| {
-                    QueryOp::Filter(FilterData {
-                        predicates: local_preds.clone(),
-                        underlying: Box::new(t),
-                    })
-                }).collect()
-            };
-            (tables_with_filter, lifted)
-        }
-        other => (vec![other], vec![]),
+        other => vec![other],
     }
 }
 
@@ -2122,131 +1858,73 @@ fn build_incremental_join(
         else { QueryOp::Filter(FilterData { predicates, underlying: Box::new(t) }) };
     }
 
+    // Sort by cardinality initially
     let mut remaining: Vec<(QueryOp, u64)> = tables.into_iter()
         .map(|t| { let c = estimate_scan_cardinality(&t, ctx); (t, c) })
         .collect();
     remaining.sort_by_key(|(_,c)| *c);
 
-    // eprintln!("[JOIN_ORDER] {} tables sorted by cardinality:", remaining.len());
-    // for (t, size) in &remaining {
-    //     eprintln!("[JOIN_ORDER]   {} (est. {})",
-    //         get_scan_table_name(t).unwrap_or_else(|| "complex".into()), size);
-    // }
-
     let mut remaining_preds = predicates;
 
     // Pick first table (smallest)
-    let (first, first_size) = remaining.remove(0);
-    let first_name = get_scan_table_name(&first).unwrap_or_else(|| "complex".into());
+    let (first, _) = remaining.remove(0);
     let mut current = first;
     let mut current_schema = schema_of(&current, ctx);
 
-    // Apply literal predicates to first table immediately
-    let (first_filters, rest): (Vec<_>, Vec<_>) =
-        remaining_preds.into_iter().partition(|p| {
-            let lhs_ok = current_schema.iter().any(|(n,_)| n == &p.column_name);
-            let rhs_ok = match &p.value {
-                ComparisionValue::Column(_) => false, // cross-table — keep for later
-                _ => true, // literal predicate — apply now
-            };
-            lhs_ok && rhs_ok
-        });
-    remaining_preds = rest;
-
-    if !first_filters.is_empty() {
-        // eprintln!("[JOIN_STEP] pre-filtering start {} with {} preds", first_name, first_filters.len());
-        current = QueryOp::Filter(FilterData {
-            predicates: first_filters,
-            underlying: Box::new(current),
-        });
-    }
-
-    // eprintln!("[JOIN_STEP] start: {} ({})", first_name, first_size);
-
     while !remaining.is_empty() {
+        // Find the best next table: prefer one with equi-join predicate
+        // connecting to current_schema, then smallest cardinality
         let best_idx = {
+            // First try: find table with equi-join predicate to current schema
             let connected = remaining.iter().enumerate().find(|(_, (t, _))| {
                 let t_schema = schema_of(t, ctx);
                 remaining_preds.iter().any(|p| {
                     if p.operator != ComparisionOperator::EQ { return false; }
                     let ComparisionValue::Column(other) = &p.value else { return false; };
-                    let lhs_in_current = current_schema.iter().any(|(n,_)| n == &p.column_name);
-                    let rhs_in_t       = t_schema.iter().any(|(n,_)| n == other.as_str());
-                    let lhs_in_t       = t_schema.iter().any(|(n,_)| n == &p.column_name);
-                    let rhs_in_current = current_schema.iter().any(|(n,_)| n == other.as_str());
+                    let lhs_in_current  = current_schema.iter().any(|(n,_)| n == &p.column_name);
+                    let rhs_in_t        = t_schema.iter().any(|(n,_)| n == other.as_str());
+                    let lhs_in_t        = t_schema.iter().any(|(n,_)| n == &p.column_name);
+                    let rhs_in_current  = current_schema.iter().any(|(n,_)| n == other.as_str());
                     (lhs_in_current && rhs_in_t) || (lhs_in_t && rhs_in_current)
                 })
             });
-            if let Some((idx, _)) = connected { idx } else { 0 }
+
+            if let Some((idx, _)) = connected {
+                idx
+            } else {
+                // No connected table — pick smallest (cartesian product, unavoidable)
+                0 // already sorted by cardinality
+            }
         };
 
-        let (next_table, next_size) = remaining.remove(best_idx);
-        let next_name = get_scan_table_name(&next_table).unwrap_or_else(|| "complex".into());
+        let (next_table, _) = remaining.remove(best_idx);
         let next_schema = schema_of(&next_table, ctx);
-
-        // Predicates that JOIN current with next_table
-        let (join_preds, other_preds): (Vec<_>, Vec<_>) =
-            remaining_preds.into_iter().partition(|p| {
-                let lhs_in_current = current_schema.iter().any(|(n,_)| n == &p.column_name);
-                let lhs_in_next    = next_schema.iter().any(|(n,_)| n == &p.column_name);
-                let rhs_in_current = match &p.value {
-                    ComparisionValue::Column(c) => current_schema.iter().any(|(n,_)| n == c),
-                    _ => false,
-                };
-                let rhs_in_next = match &p.value {
-                    ComparisionValue::Column(c) => next_schema.iter().any(|(n,_)| n == c),
-                    _ => false,
-                };
-                (lhs_in_current && rhs_in_next) || (lhs_in_next && rhs_in_current)
-            });
-
-        // Literal predicates that apply only to next_table
-        let (next_filters, rest_preds): (Vec<_>, Vec<_>) =
-            other_preds.into_iter().partition(|p| {
-                let lhs_in_next = next_schema.iter().any(|(n,_)| n == &p.column_name);
-                let rhs_ok = match &p.value {
-                    ComparisionValue::Column(_) => false, // cross-table, not ready yet
-                    _ => true,
-                };
-                lhs_in_next && rhs_ok
-            });
-
-        // eprintln!("[PREDS] join_preds: {:?}",
-        //     join_preds.iter().map(|p| format!("{} {:?} {:?}", p.column_name, p.operator, p.value)).collect::<Vec<_>>());
-        // eprintln!("[PREDS] next_filters: {:?}",
-        //     next_filters.iter().map(|p| format!("{} {:?} {:?}", p.column_name, p.operator, p.value)).collect::<Vec<_>>());
-        // eprintln!("[PREDS] rest: {:?}",
-        //     rest_preds.iter().map(|p| format!("{} {:?} {:?}", p.column_name, p.operator, p.value)).collect::<Vec<_>>());
-
-        remaining_preds = rest_preds;
-
-        let filtered_next = if next_filters.is_empty() {
-            next_table
-        } else {
-            // eprintln!("[JOIN_STEP] pre-filtering {} with {} preds", next_name, next_filters.len());
-            QueryOp::Filter(FilterData {
-                predicates: next_filters,
-                underlying: Box::new(next_table),
-            })
-        };
-
         let combined: Schema = current_schema.iter()
             .chain(next_schema.iter()).cloned().collect();
 
+        // Extract predicates where ALL referenced columns are now available
+        let (apply_now, apply_later): (Vec<_>, Vec<_>) =
+            remaining_preds.into_iter().partition(|p| {
+                let lhs_ok = combined.iter().any(|(n,_)| n == &p.column_name);
+                let rhs_ok = match &p.value {
+                    ComparisionValue::Column(c) => combined.iter().any(|(n,_)| n == c),
+                    _ => true,
+                };
+                lhs_ok && rhs_ok
+            });
+
+        remaining_preds = apply_later;
+
         let cross = QueryOp::Cross(CrossData {
             left:  Box::new(current),
-            right: Box::new(filtered_next),
+            right: Box::new(next_table),
         });
 
-        current = if join_preds.is_empty() { cross }
-        else {
-            // eprintln!("[JOIN_STEP] join {} (est. {}) — {} join preds, {} remaining",
-            //     next_name, next_size, join_preds.len(), remaining_preds.len());
-            QueryOp::Filter(FilterData {
-                predicates: join_preds,
-                underlying: Box::new(cross),
-            })
-        };
+        current = if apply_now.is_empty() { cross }
+        else { QueryOp::Filter(FilterData {
+            predicates: apply_now,
+            underlying: Box::new(cross),
+        })};
 
         current_schema = combined;
     }
@@ -2261,17 +1939,6 @@ fn build_incremental_join(
     current
 }
 
-fn collect_stacked_filters(op: QueryOp) -> (Vec<common::query::Predicate>, QueryOp) {
-    match op {
-        QueryOp::Filter(f) => {
-            let (mut preds, underlying) = collect_stacked_filters(*f.underlying);
-            preds.extend(f.predicates);
-            (preds, underlying)
-        }
-        other => (vec![], other),
-    }
-}
-
 fn reorder_joins(op: QueryOp, ctx: &DbContext) -> QueryOp {
     match op {
         QueryOp::Sort(s) => QueryOp::Sort(SortData {
@@ -2282,76 +1949,54 @@ fn reorder_joins(op: QueryOp, ctx: &DbContext) -> QueryOp {
             underlying: Box::new(reorder_joins(*p.underlying, ctx)),
             column_name_map: p.column_name_map,
         }),
-        QueryOp::Filter(f) => {
-            // Collect ALL stacked filter predicates to see what's underneath
-            let mut all_preds = f.predicates;
-            let (more_preds, underlying) = collect_stacked_filters(*f.underlying);
-            all_preds.extend(more_preds);
-
-            if matches!(&underlying, QueryOp::Cross(_)) {
-                let (tables, recovered) = extract_all(underlying);
-                all_preds.extend(recovered);
-
-                eprintln!("[REORDER] {} tables, {} predicates", tables.len(), all_preds.len());
-
-                if tables.len() <= 2 {
-                    let cross = tables.into_iter().reduce(|l, r| {
-                        QueryOp::Cross(CrossData { left: Box::new(l), right: Box::new(r) })
-                    }).unwrap();
-                    return if all_preds.is_empty() { cross }
-                    else { QueryOp::Filter(FilterData {
-                        predicates: all_preds, underlying: Box::new(cross),
-                    })};
-                }
-                return build_incremental_join(tables, all_preds, ctx);
+        QueryOp::Filter(f) if matches!(f.underlying.as_ref(), QueryOp::Cross(_)) => {
+            let tables = flatten_cross_tree_owned(*f.underlying);
+            // eprintln!("[REORDER] {} tables detected", tables.len());
+            if tables.len() <= 2 {
+                let cross = tables.into_iter().reduce(|l, r| {
+                    QueryOp::Cross(CrossData { left: Box::new(l), right: Box::new(r) })
+                }).unwrap();
+                return QueryOp::Filter(FilterData {
+                    predicates: f.predicates,
+                    underlying: Box::new(cross),
+                });
             }
-
-            // Not a Cross underneath — just recurse
-            let new_underlying = reorder_joins(underlying, ctx);
-            if all_preds.is_empty() {
-                new_underlying
-            } else {
-                QueryOp::Filter(FilterData {
-                    predicates: all_preds,
-                    underlying: Box::new(new_underlying),
-                })
-            }
-        },
-        QueryOp::Cross(c) => QueryOp::Cross(CrossData {
-            left:  Box::new(reorder_joins(*c.left, ctx)),
-            right: Box::new(reorder_joins(*c.right, ctx)),
+            build_incremental_join(tables, f.predicates, ctx)
+        }
+        QueryOp::Filter(f) => QueryOp::Filter(FilterData {
+            predicates: f.predicates,
+            underlying: Box::new(reorder_joins(*f.underlying, ctx)),
         }),
-        QueryOp::Scan(_) => op,
+        other => other,
     }
 }
 
 fn optimize(op: QueryOp, ctx: &DbContext) -> QueryOp {
-    // Pass 1: reorder joins on raw tree (predicates not yet pushed)
+    // Step 1: recursively optimize children
     let op = reorder_joins(op, ctx);
-    // Pass 2: push predicates down on the reordered tree
-    push_down_pass(op, ctx)
-}
 
-fn push_down_pass(op: QueryOp, ctx: &DbContext) -> QueryOp {
     match op {
         QueryOp::Filter(f) => {
-            let c = push_down_pass(*f.underlying, ctx);
+            let c = optimize(*f.underlying, ctx);
             push_filter_down(f.predicates, c, ctx)
         }
         QueryOp::Sort(s) => QueryOp::Sort(SortData {
-            underlying: Box::new(push_down_pass(*s.underlying, ctx)),
+            underlying: Box::new(optimize(*s.underlying, ctx)),
             sort_specs: s.sort_specs,
         }),
         QueryOp::Project(p) => QueryOp::Project(ProjectData {
-            underlying: Box::new(push_down_pass(*p.underlying, ctx)),
+            underlying: Box::new(optimize(*p.underlying, ctx)),
             column_name_map: p.column_name_map,
         }),
         QueryOp::Cross(c) => QueryOp::Cross(CrossData {
-            left:  Box::new(push_down_pass(*c.left, ctx)),
-            right: Box::new(push_down_pass(*c.right, ctx)),
+            left:  Box::new(optimize(*c.left, ctx)),
+            right: Box::new(optimize(*c.right, ctx)),
         }),
         QueryOp::Scan(_) => op,
     }
+
+    // Step 2: reorder multi-way joins after pushdown
+    
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -2383,7 +2028,6 @@ fn db_main() -> Result<()> {
 
     // Optimize
     let query_root = optimize(query.root, &ctx);
-    // eprintln!("[FINAL_TREE] {:?}", query_root);
 
     // Signal start — wrap monitor_out in BufWriter for batched row output
     monitor_out.write_all(b"validate\n")?;
