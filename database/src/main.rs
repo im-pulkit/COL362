@@ -586,18 +586,6 @@ struct DPEntry {
     schema:      Schema,
 }
 
-fn debug_plan_structure(op: &QueryOp) -> String {
-    match op {
-        QueryOp::Cross(c) => format!("({} ⋈ {})",
-            debug_plan_structure(&c.left),
-            debug_plan_structure(&c.right)),
-        QueryOp::Filter(f) => debug_plan_structure(&f.underlying),
-        QueryOp::Project(p) => debug_plan_structure(&p.underlying),
-        QueryOp::Scan(s) => s.table_id.clone(),
-        _ => "?".to_string(),
-    }
-}
-
 /// Bitmask-based DP join optimizer.
 /// Considers all left-deep plans, picks minimum cost.
 fn dp_optimize(
@@ -606,8 +594,6 @@ fn dp_optimize(
     ctx:        &DbContext,
 ) -> QueryOp {
     let n = relations.len();
-    for r in &relations {
-    }
     if n == 1 {
         let r = relations.into_iter().next().unwrap();
         return if predicates.is_empty() { r }
@@ -723,59 +709,21 @@ fn dp_optimize(
 
                 // Estimate join cardinality
                 let join_card = if has_equi {
-                let equi = join_preds.iter().find(|p| {
-                    p.operator == ComparisionOperator::EQ &&
-                    matches!(&p.value, ComparisionValue::Column(_))
-                }).unwrap();
-
-                let other_col = match &equi.value {
-                    ComparisionValue::Column(c) => c.as_str(),
-                    _ => unreachable!(),
-                };
-
-                // Determine which column belongs to which side
-                let lhs_in_left = left.schema.iter().any(|(n,_)| n == &equi.column_name);
-                let (left_col, right_col) = if lhs_in_left {
-                    (equi.column_name.as_str(), other_col)
+                    // Find the equi-pair to estimate selectivity
+                    let equi = join_preds.iter().find(|p| {
+                        p.operator == ComparisionOperator::EQ &&
+                        matches!(&p.value, ComparisionValue::Column(_))
+                    }).unwrap();
+                    let other_col = match &equi.value {
+                        ComparisionValue::Column(c) => c.as_str(),
+                        _ => unreachable!(),
+                    };
+                    // Distinct values estimate from one side
+                    let max_distinct = left.cardinality.max(right.cardinality).max(1);
+                    ((left.cardinality as f64 * right.cardinality as f64) / max_distinct as f64).max(1.0) as u64
                 } else {
-                    (other_col, equi.column_name.as_str())
+                    left.cardinality.saturating_mul(right.cardinality)
                 };
-
-                // Look up density on original tables (only if either side is a single base table)
-                let left_table  = single_table_name(&left.plan);
-                let right_table = single_table_name(&right.plan);
-
-                let left_unique  = left_table.as_ref()
-                    .map_or(false, |t| stat_is_unique(t, left_col, ctx));
-                let right_unique = right_table.as_ref()
-                    .map_or(false, |t| stat_is_unique(t, right_col, ctx));
-
-                // FK-aware estimation:
-                // If left.col is unique (PK), each right row matches ≤ 1 left row.
-                // Output ≈ right_card × (left_filtered / left_base) — accounts for left's filter selectivity
-                if left_unique && !right_unique {
-                    let left_base = left_table.as_ref()
-                        .and_then(|t| stat_cardinality(t, ctx))
-                        .unwrap_or(left.cardinality);
-                    let selectivity = (left.cardinality as f64 / left_base.max(1) as f64).min(1.0);
-                    ((right.cardinality as f64) * selectivity).max(1.0) as u64
-                } else if right_unique && !left_unique {
-                    let right_base = right_table.as_ref()
-                        .and_then(|t| stat_cardinality(t, ctx))
-                        .unwrap_or(right.cardinality);
-                    let selectivity = (right.cardinality as f64 / right_base.max(1) as f64).min(1.0);
-                    ((left.cardinality as f64) * selectivity).max(1.0) as u64
-                } else if left_unique && right_unique {
-                    // Both unique — output ≤ min
-                    left.cardinality.min(right.cardinality).max(1)
-                } else {
-                    // Neither unique — generic formula
-                    let max_d = left.cardinality.max(right.cardinality).max(1);
-                    ((left.cardinality as f64 * right.cardinality as f64) / max_d as f64).max(1.0) as u64
-                }
-            } else {
-                left.cardinality.saturating_mul(right.cardinality)
-            };
 
                 // Estimate cost of the join
                 let left_blocks  = (left.cardinality  / 50).max(1);
@@ -843,7 +791,6 @@ fn dp_optimize(
         Some(e) => e,
         None => return build_incremental_join(relations, predicates, ctx),
     };
-
 
     // Apply any remaining predicates that weren't handled
     let used_preds: Vec<bool> = vec![false; predicates.len()];
@@ -2274,6 +2221,7 @@ fn spill_hash_join_to_anon_generic(
         );
     }
     // Fallback for small results
+    // eprintln!("[SPILL_GENERIC] collecting rows for fallback...");
     let mut rows: Vec<Row> = Vec::new();
     let mut schema_out: Option<Schema> = None;
     let child_schema = execute(op, ctx, disk_out, disk_in, block_size, allocator,
@@ -2282,6 +2230,7 @@ fn spill_hash_join_to_anon_generic(
             rows.push(row);
             Ok(())
         })?;
+    // eprintln!("[SPILL_GENERIC] collected {} rows", rows.len());
     let schema = schema_out.unwrap_or(child_schema);
     let start = allocator.next;
     let mut writer = BlockWriter::new(block_size, start);
@@ -2301,15 +2250,18 @@ fn exec_sort(
     emit:       &mut dyn FnMut(Row, &Schema) -> Result<()>,
 ) -> Result<Schema> {
     if let Some(pipeline) = try_flatten(&sort_data.underlying) {
+        // eprintln!("[SORT] using pipeline path for {}", pipeline.scan.table_id);
         return exec_sort_from_pipeline(
             &pipeline, sort_data, ctx, disk_out, disk_in, block_size, allocator, emit
         );
     }
+    // eprintln!("[SORT] using slow path");
 
     let (child_start, child_num, child_schema) =
         spill_hash_join_to_anon_generic(
             &sort_data.underlying, ctx, disk_out, disk_in, block_size, allocator
         )?;
+    // eprintln!("[SORT] child_num={} blocks", child_num);
 
     if child_num == 0 { return Ok(child_schema); }
 
@@ -2339,6 +2291,7 @@ fn exec_sort(
                 break;
             }
         }
+        // eprintln!("[SORT] batch: {} rows, {} bytes", batch.len(), batch_bytes);
 
         block_idx += blocks_read;
 
@@ -2366,6 +2319,7 @@ fn exec_sort(
             }
         }
     } else {
+        // eprintln!("[SORT] {} runs to merge", runs.len());
         merge_runs(runs, &child_schema, sort_data, disk_out, disk_in, block_size, emit)?;
     }
 
@@ -2409,7 +2363,9 @@ fn exec_sort_from_pipeline(
 
             // // Debug first row
             // if total_rows == 0 {
+            //     eprintln!("[SORT_DEBUG] first row size estimate: {}, cols: {}",
             //         serialize_row_bytes(&final_row).len(), final_row.len());
+            //     eprintln!("[SORT_DEBUG] SORT_RUN_BYTES={}", SORT_RUN_BYTES);
             // }
 
             batch_bytes += serialize_row_bytes(&final_row).len();
@@ -2417,6 +2373,7 @@ fn exec_sort_from_pipeline(
             total_rows += 1;
 
             if batch_bytes > SORT_RUN_BYTES {
+                // eprintln!("[SORT_DEBUG] spilling run at row {}, batch_bytes={}",
                 //     total_rows, batch_bytes);
                 batch.sort_by(|a, b|
                     compare_rows(a, b, &out_schema, &sort_data.sort_specs));
@@ -2428,6 +2385,7 @@ fn exec_sort_from_pipeline(
         }
     }
 
+    // eprintln!("[SORT_DEBUG] total_rows={} runs={}", total_rows, runs.len());
 
     if runs.is_empty() {
         batch.sort_by(|a, b|
