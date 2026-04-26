@@ -1427,7 +1427,7 @@ fn spill_hash_join_to_anon_generic(
         );
     }
     // Fallback for small results
-    eprintln!("[SPILL_GENERIC] collecting rows for fallback...");
+    // eprintln!("[SPILL_GENERIC] collecting rows for fallback...");
     let mut rows: Vec<Row> = Vec::new();
     let mut schema_out: Option<Schema> = None;
     let child_schema = execute(op, ctx, disk_out, disk_in, block_size, allocator,
@@ -1436,7 +1436,7 @@ fn spill_hash_join_to_anon_generic(
             rows.push(row);
             Ok(())
         })?;
-    eprintln!("[SPILL_GENERIC] collected {} rows", rows.len());
+    // eprintln!("[SPILL_GENERIC] collected {} rows", rows.len());
     let schema = schema_out.unwrap_or(child_schema);
     let start = allocator.next;
     let mut writer = BlockWriter::new(block_size, start);
@@ -1456,12 +1456,12 @@ fn exec_sort(
     emit:       &mut dyn FnMut(Row, &Schema) -> Result<()>,
 ) -> Result<Schema> {
     if let Some(pipeline) = try_flatten(&sort_data.underlying) {
-        eprintln!("[SORT] using pipeline path for {}", pipeline.scan.table_id);
+        // eprintln!("[SORT] using pipeline path for {}", pipeline.scan.table_id);
         return exec_sort_from_pipeline(
             &pipeline, sort_data, ctx, disk_out, disk_in, block_size, allocator, emit
         );
     }
-    eprintln!("[SORT] using slow path");
+    // eprintln!("[SORT] using slow path");
 
     let (child_start, child_num, child_schema) =
         spill_hash_join_to_anon_generic(
@@ -1567,20 +1567,20 @@ fn exec_sort_from_pipeline(
             let final_row = apply_project_chain(row, &base_schema, &pipeline.projects);
             if !passes_all_filters(&final_row, &out_schema, &post_filters) { continue; }
 
-            // Debug first row
-            if total_rows == 0 {
-                eprintln!("[SORT_DEBUG] first row size estimate: {}, cols: {}",
-                    serialize_row_bytes(&final_row).len(), final_row.len());
-                eprintln!("[SORT_DEBUG] SORT_RUN_BYTES={}", SORT_RUN_BYTES);
-            }
+            // // Debug first row
+            // if total_rows == 0 {
+            //     eprintln!("[SORT_DEBUG] first row size estimate: {}, cols: {}",
+            //         serialize_row_bytes(&final_row).len(), final_row.len());
+            //     eprintln!("[SORT_DEBUG] SORT_RUN_BYTES={}", SORT_RUN_BYTES);
+            // }
 
             batch_bytes += serialize_row_bytes(&final_row).len();
             batch.push(final_row);
             total_rows += 1;
 
             if batch_bytes > SORT_RUN_BYTES {
-                eprintln!("[SORT_DEBUG] spilling run at row {}, batch_bytes={}",
-                    total_rows, batch_bytes);
+                // eprintln!("[SORT_DEBUG] spilling run at row {}, batch_bytes={}",
+                //     total_rows, batch_bytes);
                 batch.sort_by(|a, b|
                     compare_rows(a, b, &out_schema, &sort_data.sort_specs));
                 let (rs, rn) = spill_rows_to_anon(&batch, disk_out, block_size, allocator)?;
@@ -1591,7 +1591,7 @@ fn exec_sort_from_pipeline(
         }
     }
 
-    eprintln!("[SORT_DEBUG] total_rows={} runs={}", total_rows, runs.len());
+    // eprintln!("[SORT_DEBUG] total_rows={} runs={}", total_rows, runs.len());
 
     if runs.is_empty() {
         batch.sort_by(|a, b|
