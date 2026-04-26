@@ -226,617 +226,6 @@ fn apply_project_chain(row: Row, base: &Schema, projects: &[&ProjectData]) -> Ro
     r
 }
 
-// ── Statistics Access Helpers ─────────────────────────────────────────────────
-
-/// Get the row cardinality of a table from its CardinalityStat.
-fn stat_cardinality(table_name: &str, ctx: &DbContext) -> Option<u64> {
-    use db_config::statistics::ColumnStat;
-    let table = ctx.get_table_specs().iter().find(|t| t.name == table_name)?;
-    // Cardinality is the same for every column — pick the first one with stats
-    for col in &table.column_specs {
-        if let Some(stats) = &col.stats {
-            for s in stats {
-                if let ColumnStat::CardinalityStat(c) = s {
-                    return Some(c.0);
-                }
-            }
-        }
-    }
-    None
-}
-
-/// Get density (unique_values / total_rows) for a column. 1.0 = unique key.
-fn stat_density(table_name: &str, col_name: &str, ctx: &DbContext) -> Option<f64> {
-    use db_config::statistics::ColumnStat;
-    let table = ctx.get_table_specs().iter().find(|t| t.name == table_name)?;
-    let col   = table.column_specs.iter().find(|c| c.column_name == col_name)?;
-    let stats = col.stats.as_ref()?;
-    for s in stats {
-        if let ColumnStat::DensityStat(d) = s {
-            return Some(d.0 as f64);
-        }
-    }
-    None
-}
-
-/// Number of distinct values in a column = density * cardinality.
-fn stat_distinct_values(table_name: &str, col_name: &str, ctx: &DbContext) -> Option<u64> {
-    let card    = stat_cardinality(table_name, ctx)?;
-    let density = stat_density(table_name, col_name, ctx)?;
-    Some(((card as f64) * density).max(1.0) as u64)
-}
-
-/// Get the [lower, upper] range for a column, if known.
-fn stat_range(table_name: &str, col_name: &str, ctx: &DbContext) -> Option<(Data, Data)> {
-    use db_config::statistics::ColumnStat;
-    let table = ctx.get_table_specs().iter().find(|t| t.name == table_name)?;
-    let col   = table.column_specs.iter().find(|c| c.column_name == col_name)?;
-    let stats = col.stats.as_ref()?;
-    for s in stats {
-        if let ColumnStat::RangeStat(r) = s {
-            return Some((r.lower_bound.clone(), r.upper_bound.clone()));
-        }
-    }
-    None
-}
-
-/// Check if a column is a unique key (density = 1.0).
-fn stat_is_unique(table_name: &str, col_name: &str, ctx: &DbContext) -> bool {
-    stat_density(table_name, col_name, ctx)
-        .map_or(false, |d| (d - 1.0).abs() < 0.001)
-}
-
-/// Estimate the number of blocks for a table (for I/O cost calculations).
-fn stat_blocks(table_name: &str, ctx: &DbContext, disk_out: &mut impl Write,
-               disk_in: &mut (impl BufRead + Read)) -> Option<u64> {
-    let table = ctx.get_table_specs().iter().find(|t| t.name == table_name)?;
-    disk_get_file_num_blocks(disk_out, disk_in, &table.file_id).ok()
-}
-
-/// Estimate blocks for a table using cardinality (no disk access required).
-/// Assumes ~80 bytes per row for tpch tables → ~50 rows per 4KB block.
-fn stat_blocks_estimate(table_name: &str, ctx: &DbContext) -> u64 {
-    stat_cardinality(table_name, ctx)
-        .map(|c| (c / 50).max(1))
-        .unwrap_or(1)
-}
-
-// ── Cost Model ────────────────────────────────────────────────────────────────
-// Cost is in "block I/O units". 1 unit = reading one block.
-// Writes cost more than reads due to seek patterns.
-
-const COST_READ:  f64 = 1.0;
-const COST_WRITE: f64 = 2.0;
-/// Memory budget in blocks (12MB / 4KB = 3072 blocks).
-const MEMORY_BLOCKS: u64 = 3072;
-
-/// Cost of sequentially scanning a table.
-fn cost_seq_scan(blocks: u64) -> f64 {
-    blocks as f64 * COST_READ
-}
-
-/// Cost of nested loop join: O(N × M) row comparisons + scan both tables.
-/// Reads inner table once per outer row → catastrophic for large tables.
-fn cost_nested_loop(left_blocks: u64, right_blocks: u64, left_rows: u64) -> f64 {
-    let l = left_blocks as f64;
-    let r = right_blocks as f64;
-    l * COST_READ + (left_rows as f64) * r * COST_READ
-}
-
-/// Cost of block nested loop: reads inner table once per BLOCK of outer.
-/// Much better than NLJ when tables are larger than memory.
-fn cost_block_nl(left_blocks: u64, right_blocks: u64) -> f64 {
-    let l = left_blocks as f64;
-    let r = right_blocks as f64;
-    l * COST_READ + l * r * COST_READ
-}
-
-/// Cost of in-memory hash join (build side fits in RAM).
-/// Read both sides once: O(N + M). Best for small × large.
-fn cost_hash_join_simple(left_blocks: u64, right_blocks: u64) -> f64 {
-    let l = left_blocks as f64;
-    let r = right_blocks as f64;
-    (l + r) * COST_READ
-}
-
-/// Cost of grace hash join: partition both sides to disk, then join partitions.
-/// 3 × (R + S) — read both, write both, read both again.
-fn cost_hash_join_grace(left_blocks: u64, right_blocks: u64) -> f64 {
-    let l = left_blocks as f64;
-    let r = right_blocks as f64;
-    (l + r) * COST_READ + (l + r) * COST_WRITE + (l + r) * COST_READ
-}
-
-/// Cost of sort-merge join when BOTH sides are already physically ordered.
-/// Just streams both — best possible.
-fn cost_sort_merge_ordered(left_blocks: u64, right_blocks: u64) -> f64 {
-    let l = left_blocks as f64;
-    let r = right_blocks as f64;
-    (l + r) * COST_READ
-}
-
-/// Cost of sort-merge join when one or both sides need sorting first.
-/// Sort cost = 2 × N × log(N/M) where M is memory budget.
-fn cost_sort_merge_with_sort(
-    left_blocks: u64, right_blocks: u64,
-    left_needs_sort: bool, right_needs_sort: bool,
-    memory_blocks: u64,
-) -> f64 {
-    let l = left_blocks as f64;
-    let r = right_blocks as f64;
-    let mut total = (l + r) * COST_READ; // final merge phase reads both
-    if left_needs_sort  { total += cost_external_sort(left_blocks,  memory_blocks); }
-    if right_needs_sort { total += cost_external_sort(right_blocks, memory_blocks); }
-    total
-}
-
-/// Cost of external merge sort: 2 × blocks × num_passes.
-fn cost_external_sort(blocks: u64, memory_blocks: u64) -> f64 {
-    if blocks <= memory_blocks {
-        // Fits in memory — single pass
-        return blocks as f64 * COST_READ;
-    }
-    let b = blocks as f64;
-    let m = (memory_blocks.max(2)) as f64;
-    let passes = (b.log2() / m.log2()).ceil().max(1.0);
-    2.0 * b * passes
-}
-
-/// Estimate join output cardinality given inputs and join key densities.
-/// For equi-join R.A = S.B with densities dA, dB:
-///   |R ⋈ S| = (|R| × |S|) / max(distinct(R.A), distinct(S.B))
-fn estimate_join_cardinality(
-    left_card:    u64,
-    right_card:   u64,
-    left_distinct:  Option<u64>,
-    right_distinct: Option<u64>,
-) -> u64 {
-    let max_distinct = left_distinct.unwrap_or(left_card)
-        .max(right_distinct.unwrap_or(right_card))
-        .max(1);
-    ((left_card as f64) * (right_card as f64) / (max_distinct as f64)) as u64
-}
-
-/// Estimate selectivity of a single predicate.
-/// EQ on column C with N distinct values → selectivity = 1/N
-/// Range predicates → use range stats
-/// Other → 0.1 default
-fn estimate_predicate_selectivity(
-    pred:        &common::query::Predicate,
-    table_name:  &str,
-    col_name:    &str,
-    ctx:         &DbContext,
-) -> f64 {
-    use ComparisionOperator as Op;
-    use ComparisionValue as V;
-
-    match (&pred.operator, &pred.value) {
-        (Op::EQ, V::Column(_)) => {
-            // Join predicate — selectivity handled in join estimator
-            1.0
-        }
-        (Op::EQ, _) => {
-            stat_distinct_values(table_name, col_name, ctx)
-                .map(|n| 1.0 / (n as f64))
-                .unwrap_or(0.1)
-        }
-        (Op::NE, _) => 0.9,
-        (Op::LT | Op::LTE | Op::GT | Op::GTE, _) => {
-            // Default range selectivity — could refine with histogram
-            0.33
-        }
-    }
-}
-
-// ── Cardinality Estimator ─────────────────────────────────────────────────────
-// Estimates the size of intermediate results given a set of joined tables
-// and applied predicates.
-
-use std::collections::HashMap;
-
-/// A single relation's contribution to a join subset
-#[derive(Clone)]
-struct RelationInfo {
-    table_name:  String,
-    cardinality: u64,
-    blocks:      u64,
-    schema:      Schema,
-}
-
-impl RelationInfo {
-    fn from_op(op: &QueryOp, ctx: &DbContext) -> Option<Self> {
-        let table_name = get_scan_table_name(op)?;
-        let cardinality = stat_cardinality(&table_name, ctx).unwrap_or(1);
-        let blocks      = stat_blocks_estimate(&table_name, ctx);
-        let schema      = schema_of(op, ctx);
-        Some(Self { table_name, cardinality, blocks, schema })
-    }
-}
-
-/// Estimate the cardinality of a subset of joined relations after applying
-/// all relevant predicates. Used by DP to score plans.
-fn estimate_subset_cardinality(
-    relations:  &[&RelationInfo],
-    predicates: &[common::query::Predicate],
-    ctx:        &DbContext,
-) -> u64 {
-    if relations.is_empty() { return 0; }
-
-    // Start with cartesian product
-    let mut total: f64 = relations.iter()
-        .map(|r| r.cardinality as f64).product();
-
-    // Combined schema for predicate matching
-    let combined: Vec<&str> = relations.iter()
-        .flat_map(|r| r.schema.iter().map(|(n,_)| n.as_str()))
-        .collect();
-
-    // Apply each predicate's selectivity
-    for pred in predicates {
-        let lhs_in = combined.iter().any(|n| n == &pred.column_name);
-        let rhs_in = match &pred.value {
-            ComparisionValue::Column(c) => combined.iter().any(|n| n == c),
-            _ => true,
-        };
-        if !lhs_in || !rhs_in { continue; }
-
-        let selectivity = match &pred.value {
-            ComparisionValue::Column(other) => {
-                // Equi-join: selectivity = 1 / max(distinct(A), distinct(B))
-                let lhs_distinct = relations.iter()
-                    .find(|r| r.schema.iter().any(|(n,_)| n == &pred.column_name))
-                    .and_then(|r| stat_distinct_values(&r.table_name, &pred.column_name, ctx));
-                let rhs_distinct = relations.iter()
-                    .find(|r| r.schema.iter().any(|(n,_)| n == other))
-                    .and_then(|r| stat_distinct_values(&r.table_name, other, ctx));
-                let max_d = lhs_distinct.unwrap_or(1000).max(rhs_distinct.unwrap_or(1000)).max(1);
-                1.0 / (max_d as f64)
-            }
-            _ => {
-                // Literal predicate
-                let table = relations.iter()
-                    .find(|r| r.schema.iter().any(|(n,_)| n == &pred.column_name));
-                if let Some(rel) = table {
-                    estimate_predicate_selectivity(pred, &rel.table_name, &pred.column_name, ctx)
-                } else {
-                    0.1
-                }
-            }
-        };
-
-        total *= selectivity;
-    }
-
-    total.max(1.0) as u64
-}
-
-/// Estimate the I/O cost of executing a join with a given algorithm
-fn estimate_join_cost(
-    left_blocks:  u64,
-    right_blocks: u64,
-    left_card:    u64,
-    right_card:   u64,
-    left_ordered_on_join_key:  bool,
-    right_ordered_on_join_key: bool,
-    has_equi_pred: bool,
-) -> (f64, &'static str) {
-    let mut best = (f64::INFINITY, "nested_loop");
-
-    // Always available: nested loop (worst case)
-    let nlj = cost_nested_loop(left_blocks, right_blocks, left_card);
-    if nlj < best.0 { best = (nlj, "nested_loop"); }
-
-    // Block nested loop — always better than NLJ
-    let bnl = cost_block_nl(left_blocks, right_blocks);
-    if bnl < best.0 { best = (bnl, "block_nested_loop"); }
-
-    if has_equi_pred {
-        // Hash join (in-memory if smaller side fits)
-        let smaller = left_blocks.min(right_blocks);
-        if smaller <= MEMORY_BLOCKS {
-            let hj = cost_hash_join_simple(left_blocks, right_blocks);
-            if hj < best.0 { best = (hj, "hash_join_simple"); }
-        }
-
-        // Grace hash join (always available for equi)
-        let ghj = cost_hash_join_grace(left_blocks, right_blocks);
-        if ghj < best.0 { best = (ghj, "hash_join_grace"); }
-
-        // Sort-merge join
-        let smj = if left_ordered_on_join_key && right_ordered_on_join_key {
-            cost_sort_merge_ordered(left_blocks, right_blocks)
-        } else {
-            cost_sort_merge_with_sort(
-                left_blocks, right_blocks,
-                !left_ordered_on_join_key, !right_ordered_on_join_key,
-                MEMORY_BLOCKS,
-            )
-        };
-        if smj < best.0 { best = (smj, "sort_merge"); }
-    }
-
-    best
-}
-
-/// Find equi-join predicates between two sets of schemas
-fn find_equi_predicates<'a>(
-    left_schemas:  &[&Schema],
-    right_schemas: &[&Schema],
-    predicates:    &'a [common::query::Predicate],
-) -> Vec<&'a common::query::Predicate> {
-    predicates.iter().filter(|p| {
-        if p.operator != ComparisionOperator::EQ { return false; }
-        let ComparisionValue::Column(other) = &p.value else { return false; };
-        let lhs_left  = left_schemas.iter().any(|s| s.iter().any(|(n,_)| n == &p.column_name));
-        let rhs_right = right_schemas.iter().any(|s| s.iter().any(|(n,_)| n == other.as_str()));
-        let lhs_right = right_schemas.iter().any(|s| s.iter().any(|(n,_)| n == &p.column_name));
-        let rhs_left  = left_schemas.iter().any(|s| s.iter().any(|(n,_)| n == other.as_str()));
-        (lhs_left && rhs_right) || (lhs_right && rhs_left)
-    }).collect()
-}
-
-// ── DP Join Order Optimizer ───────────────────────────────────────────────────
-
-/// Entry in the DP table — best plan for a subset of relations
-#[derive(Clone)]
-struct DPEntry {
-    plan:        QueryOp,
-    cost:        f64,
-    cardinality: u64,
-    schema:      Schema,
-}
-
-/// Bitmask-based DP join optimizer.
-/// Considers all left-deep plans, picks minimum cost.
-fn dp_optimize(
-    relations:  Vec<QueryOp>,
-    predicates: Vec<common::query::Predicate>,
-    ctx:        &DbContext,
-) -> QueryOp {
-    let n = relations.len();
-    if n == 1 {
-        let r = relations.into_iter().next().unwrap();
-        return if predicates.is_empty() { r }
-        else { QueryOp::Filter(FilterData { predicates, underlying: Box::new(r) }) };
-    }
-
-    // Detect self-joins (renamed columns) — DP doesn't handle these correctly
-    // Fall back to greedy in that case
-    let has_renamed = relations.iter().any(|op| matches!(op, QueryOp::Project(_)));
-    if has_renamed {
-        return build_incremental_join(relations, predicates, ctx);
-    }
-
-    // Build relation info for each base table
-    let rel_infos: Vec<RelationInfo> = relations.iter()
-        .map(|op| RelationInfo::from_op(op, ctx).unwrap_or_else(|| {
-            // Fallback for non-Scan ops (Project wrappers, etc.)
-            let card = estimate_scan_cardinality(op, ctx);
-            RelationInfo {
-                table_name: get_scan_table_name(op).unwrap_or_else(|| "complex".into()),
-                cardinality: card,
-                blocks: (card / 50).max(1),
-                schema: schema_of(op, ctx),
-            }
-        }))
-        .collect();
-
-    // dp[bitmask] = best plan for that subset
-    let mut dp: HashMap<u32, DPEntry> = HashMap::new();
-
-    // Base case: single relations with their literal predicates applied
-    for i in 0..n {
-        let mask = 1u32 << i;
-        let rel = &rel_infos[i];
-
-        // Apply literal predicates that reference only this table
-        let local_preds: Vec<common::query::Predicate> = predicates.iter()
-            .filter(|p| {
-                let lhs_in = rel.schema.iter().any(|(n,_)| n == &p.column_name);
-                let rhs_literal = !matches!(&p.value, ComparisionValue::Column(_));
-                lhs_in && rhs_literal
-            })
-            .cloned()
-            .collect();
-
-        // Estimate cardinality after local filters
-        let mut card = rel.cardinality as f64;
-        for p in &local_preds {
-            card *= estimate_predicate_selectivity(p, &rel.table_name, &p.column_name, ctx);
-        }
-        let filtered_card = card.max(1.0) as u64;
-
-        let plan = if local_preds.is_empty() {
-            relations[i].clone()
-        } else {
-            QueryOp::Filter(FilterData {
-                predicates: local_preds,
-                underlying: Box::new(relations[i].clone()),
-            })
-        };
-
-        // Cost = scanning the table
-        let cost = cost_seq_scan(rel.blocks);
-
-        dp.insert(mask, DPEntry {
-            plan,
-            cost,
-            cardinality: filtered_card,
-            schema: rel.schema.clone(),
-        });
-    }
-
-    // Build up subsets of size 2..n
-    for size in 2..=n {
-        let subsets = enumerate_subsets(n, size);
-        for mask in subsets {
-            let mut best: Option<DPEntry> = None;
-
-            // Try all ways to split: subset = (subset \ {i}) ⋈ {i}
-            for i in 0..n {
-                if mask & (1 << i) == 0 { continue; }
-                let left_mask  = mask & !(1u32 << i);
-                let right_mask = 1u32 << i;
-                if left_mask == 0 { continue; }
-
-                let left  = match dp.get(&left_mask)  { Some(e) => e, None => continue };
-                let right = match dp.get(&right_mask) { Some(e) => e, None => continue };
-
-                // Find equi-predicates between left and right
-                let join_preds: Vec<&common::query::Predicate> = predicates.iter().filter(|p| {
-                    let lhs_left  = left.schema.iter().any(|(n,_)| n == &p.column_name);
-                    let lhs_right = right.schema.iter().any(|(n,_)| n == &p.column_name);
-                    let rhs_left  = match &p.value {
-                        ComparisionValue::Column(c) => left.schema.iter().any(|(n,_)| n == c),
-                        _ => false,
-                    };
-                    let rhs_right = match &p.value {
-                        ComparisionValue::Column(c) => right.schema.iter().any(|(n,_)| n == c),
-                        _ => false,
-                    };
-                    (lhs_left && rhs_right) || (lhs_right && rhs_left)
-                }).collect();
-
-                // Skip cartesian products unless this is the last option
-                let has_equi = join_preds.iter().any(|p| {
-                    p.operator == ComparisionOperator::EQ
-                    && matches!(&p.value, ComparisionValue::Column(_))
-                });
-                if !has_equi && size < n {
-                    // Avoid cartesian for intermediate subsets
-                    continue;
-                }
-
-                // Estimate join cardinality
-                let join_card = if has_equi {
-                    // Find the equi-pair to estimate selectivity
-                    let equi = join_preds.iter().find(|p| {
-                        p.operator == ComparisionOperator::EQ &&
-                        matches!(&p.value, ComparisionValue::Column(_))
-                    }).unwrap();
-                    let other_col = match &equi.value {
-                        ComparisionValue::Column(c) => c.as_str(),
-                        _ => unreachable!(),
-                    };
-                    // Distinct values estimate from one side
-                    let max_distinct = left.cardinality.max(right.cardinality).max(1);
-                    ((left.cardinality as f64 * right.cardinality as f64) / max_distinct as f64).max(1.0) as u64
-                } else {
-                    left.cardinality.saturating_mul(right.cardinality)
-                };
-
-                // Estimate cost of the join
-                let left_blocks  = (left.cardinality  / 50).max(1);
-                let right_blocks = (right.cardinality / 50).max(1);
-
-                // Check if join keys are physically ordered (for sort-merge)
-                let (left_ordered, right_ordered) = if let Some(equi_pred) = join_preds.iter().find(|p| {
-                    p.operator == ComparisionOperator::EQ &&
-                    matches!(&p.value, ComparisionValue::Column(_))
-                }) {
-                    let other = if let ComparisionValue::Column(c) = &equi_pred.value { c } else { "" };
-                    let left_col = if left.schema.iter().any(|(n,_)| n == &equi_pred.column_name) {
-                        &equi_pred.column_name
-                    } else { other };
-                    let right_col = if right.schema.iter().any(|(n,_)| n == other) {
-                        other
-                    } else { &equi_pred.column_name };
-                    let lt = single_table_name(&left.plan);
-                    let rt = single_table_name(&right.plan);
-                    let lo = lt.as_ref().map_or(false, |t| is_physically_ordered(left_col, t, ctx));
-                    let ro = rt.as_ref().map_or(false, |t| is_physically_ordered(right_col, t, ctx));
-                    (lo, ro)
-                } else { (false, false) };
-
-                let (join_cost, _algo) = estimate_join_cost(
-                    left_blocks, right_blocks,
-                    left.cardinality, right.cardinality,
-                    left_ordered, right_ordered, has_equi,
-                );
-
-                let total_cost = left.cost + right.cost + join_cost;
-
-                if best.as_ref().map_or(true, |b| total_cost < b.cost) {
-                    // Build the actual plan
-                    let cross = QueryOp::Cross(CrossData {
-                        left:  Box::new(left.plan.clone()),
-                        right: Box::new(right.plan.clone()),
-                    });
-                    let plan = if join_preds.is_empty() { cross }
-                    else { QueryOp::Filter(FilterData {
-                        predicates: join_preds.iter().map(|p| (*p).clone()).collect(),
-                        underlying: Box::new(cross),
-                    })};
-                    let combined_schema: Schema = left.schema.iter()
-                        .chain(right.schema.iter()).cloned().collect();
-                    best = Some(DPEntry {
-                        plan,
-                        cost: total_cost,
-                        cardinality: join_card,
-                        schema: combined_schema,
-                    });
-                }
-            }
-
-            if let Some(entry) = best {
-                dp.insert(mask, entry);
-            }
-        }
-    }
-
-    let full_mask = (1u32 << n) - 1;
-
-    // Get the final plan, fall back to incremental join if DP failed
-    let final_entry = match dp.remove(&full_mask) {
-        Some(e) => e,
-        None => return build_incremental_join(relations, predicates, ctx),
-    };
-
-    // Apply any remaining predicates that weren't handled
-    let used_preds: Vec<bool> = vec![false; predicates.len()];
-    // Simplification: just apply any leftover predicates on top
-    let leftover: Vec<common::query::Predicate> = predicates.into_iter()
-        .filter(|p| {
-            // Check if this predicate is still applicable but wasn't in any join
-            let in_schema = final_entry.schema.iter().any(|(n,_)| n == &p.column_name);
-            let rhs_in = match &p.value {
-                ComparisionValue::Column(c) => final_entry.schema.iter().any(|(n,_)| n == c),
-                _ => true,
-            };
-            in_schema && rhs_in &&
-            // Crude check: only literal predicates that weren't captured
-            !matches!(&p.value, ComparisionValue::Column(_)) == false
-        })
-        .collect();
-
-    let _ = used_preds;
-    let _ = leftover;
-
-    final_entry.plan
-}
-
-/// Enumerate all subsets of {0..n-1} with given popcount.
-fn enumerate_subsets(n: usize, size: usize) -> Vec<u32> {
-    let mut result = Vec::new();
-    let max = 1u32 << n;
-    for mask in 1..max {
-        if (mask.count_ones() as usize) == size {
-            result.push(mask);
-        }
-    }
-    result
-}
-
-/// Get the table name if this op is a single Scan or Filter(Scan) etc.
-fn single_table_name(op: &QueryOp) -> Option<String> {
-    match op {
-        QueryOp::Scan(s) => Some(s.table_id.clone()),
-        QueryOp::Filter(f) => single_table_name(&f.underlying),
-        QueryOp::Project(p) => single_table_name(&p.underlying),
-        _ => None,
-    }
-}
-
 // ── Filter evaluation ─────────────────────────────────────────────────────────
 
 fn coerce_to_f64(v: &Data) -> Option<f64> {
@@ -1202,6 +591,53 @@ fn exec_sort_merge_join(
     Ok(combined_schema)
 }
 
+
+// ── Cross (block nested loop join with in-memory fast path) ───────────────────
+//
+// Key optimization: if right side fits in MEMORY_BUDGET_BYTES, keep it in RAM.
+// No anon disk writes → no seeks to the 19M+ block region → zero cylinder travel.
+//
+// Bonus optimization: join predicates (those referencing both sides) are applied
+// INSIDE the cross loop, not outside. This means we only emit pairs that pass,
+// avoiding massive tuple overhead for large cross products.
+
+
+/// Estimate number of blocks for an op subtree using stats or file size
+// fn estimate_blocks(op: &QueryOp, ctx: &DbContext) -> u64 {
+//     match op {
+//         QueryOp::Scan(s) => {
+//             // Use CardinalityStat if available, else return a large number
+//             let table = ctx.get_table_specs().iter()
+//                 .find(|t| t.name == s.table_id);
+//             if let Some(t) = table {
+//                 // Use cardinality of first column with CardinalityStat
+//                 for col in &t.column_specs {
+//                     if let Some(stats) = &col.stats {
+//                         for stat in stats {
+//                             if let db_config::statistics::ColumnStat::CardinalityStat(c) = stat {
+//                                 eprintln!("[DEBUG] CardinalityStat for {} = {}", s.table_id, c.0);
+//                                 return c.0; // row count estimate
+//                             }
+//                         }
+//                     }
+//                 }
+//             }
+//             eprintln!("[DEBUG] no CardinalityStat for {}", s.table_id);
+//             u64::MAX // unknown — assume large
+//         }
+//         QueryOp::Filter(f) => {
+//             // After filter, assume 10% selectivity if no stats
+//             estimate_blocks(&f.underlying, ctx) / 10
+//         }
+//         QueryOp::Project(p) => estimate_blocks(&p.underlying, ctx),
+//         QueryOp::Sort(s)    => estimate_blocks(&s.underlying, ctx),
+//         QueryOp::Cross(c)   => {
+//             let l = estimate_blocks(&c.left, ctx);
+//             let r = estimate_blocks(&c.right, ctx);
+//             l.saturating_mul(r)
+//         }
+//     }
+// }
 /// Estimate raw table cardinality ignoring filters
 fn estimate_scan_cardinality(op: &QueryOp, ctx: &DbContext) -> u64 {
     match op {
@@ -2616,6 +2052,18 @@ fn push_filter_down(
     }
 }
 
+/// Flatten a nested Cross tree into a list of leaf ops
+// fn flatten_cross_tree(op: &QueryOp) -> Vec<&QueryOp> {
+//     match op {
+//         QueryOp::Cross(c) => {
+//             let mut left = flatten_cross_tree(&c.left);
+//             left.extend(flatten_cross_tree(&c.right));
+//             left
+//         }
+//         other => vec![other],
+//     }
+// }
+
 fn flatten_cross_tree_owned(op: QueryOp) -> Vec<QueryOp> {
     match op {
         QueryOp::Cross(c) => {
@@ -2742,7 +2190,6 @@ fn build_incremental_join(
 
     current
 }
-
 fn collect_stacked_filters(op: QueryOp) -> (Vec<common::query::Predicate>, QueryOp) {
     match op {
         QueryOp::Filter(f) => {
@@ -2780,10 +2227,6 @@ fn reorder_joins(op: QueryOp, ctx: &DbContext) -> QueryOp {
                     else { QueryOp::Filter(FilterData {
                         predicates: all_preds, underlying: Box::new(cross),
                     })};
-                }
-                // Use DP for 3-16 tables, greedy fallback for larger
-                if tables.len() <= 16 {
-                    return dp_optimize(tables, all_preds, ctx);
                 }
                 return build_incremental_join(tables, all_preds, ctx);
             }
