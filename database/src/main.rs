@@ -344,7 +344,7 @@ const COST_WRITE: f64 = 2.0;
 const MEMORY_BLOCKS: u64 = 3072;
 
 /// Number of blocks to read in a single batched I/O to reduce rotational latency.
-const READ_AHEAD_BLOCKS: u64 = 32;
+const READ_AHEAD_BLOCKS: u64 = 16;
 
 /// Cost of sequentially scanning a table.
 fn cost_seq_scan(blocks: u64) -> f64 {
