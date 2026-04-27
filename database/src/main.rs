@@ -20,7 +20,7 @@ type Row    = Vec<Data>;
 // How much RAM we allow for in-memory Sort/Cross before spilling to disk.
 // Keep well under 64MB to leave room for code, stack, buffers.
 const MEMORY_BUDGET_BYTES: usize = 12 * 1024 * 1024; // 12 MB
-const SORT_RUN_BYTES: usize      = 9 * 1024 * 1024; // 9MB — Sort run size
+const SORT_RUN_BYTES: usize      = 2 * 1024 * 1024; // 9MB — Sort run size
 
 // ── AnonAllocator ─────────────────────────────────────────────────────────────
 
