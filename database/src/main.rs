@@ -67,17 +67,14 @@ impl BlockWriter {
 
     fn flush_pending(&mut self, disk_out: &mut impl Write) -> Result<()> {
         if self.pending.is_empty() { return Ok(()); }
-        let num_to_write = self.pending.len() as u64;
-        let id = self.start_block + self.num_blocks;
-        
-        // Massive optimization: Single simulated command for the entire buffer
-        disk_out.write_all(format!("put block {} {}\n", id, num_to_write).as_bytes())?;
         for p_block in &self.pending {
+            let id = self.start_block + self.num_blocks;
+            // Back to '1' block per command so the simulator understands it
+            disk_out.write_all(format!("put block {} 1\n", id).as_bytes())?;
             disk_out.write_all(p_block)?;
+            self.num_blocks += 1;
         }
         disk_out.flush()?;
-        
-        self.num_blocks += num_to_write;
         self.pending.clear();
         Ok(())
     }
@@ -754,16 +751,14 @@ fn dp_optimize(
                     continue;
                 }
 
-                // Gather the actual relations present in this specific joined subset
-                let mut subset_rels = Vec::new();
-                for j in 0..n {
-                    if (mask & (1u32 << j)) != 0 {
-                        subset_rels.push(&rel_infos[j]);
-                    }
-                }
-
-                // Utilize the orphaned, highly-accurate cardinality estimator!
-                let join_card = estimate_subset_cardinality(&subset_rels, &predicates, ctx);
+                // Inside dp_optimize
+                let join_card = if has_equi {
+                    // Safe PK-FK assumption: prevents u64::MAX overflow on 6-table joins
+                    left.cardinality.max(right.cardinality)
+                } else {
+                    // Capped Cartesian fallback
+                    left.cardinality.saturating_mul(right.cardinality).min(100_000_000_000)
+                };
 
                 // Estimate cost of the join
                 let left_blocks  = (left.cardinality  / 50).max(1);
@@ -1104,16 +1099,15 @@ impl<'a> StreamingPipelineReader<'a> {
     ) -> Result<bool> {
         if self.cur_block >= self.num_blocks { return Ok(false); }
         self.rows.clear();
+        let blocks_to_read = 32.min(self.num_blocks - self.cur_block);
         
-        let blocks_to_read = 64.min(self.num_blocks - self.cur_block);
-        let buf = disk_read_blocks(disk_out, disk_in, self.start_block + self.cur_block, blocks_to_read, block_size)?;
-        
-        for b in 0..blocks_to_read {
-            let offset = (b * block_size) as usize;
-            self.rows.extend(parse_block(&buf[offset .. offset + block_size as usize], &self.col_types));
+        for _ in 0..blocks_to_read {
+            // Back to '1' block per command
+            let block = disk_read_block(disk_out, disk_in, self.start_block + self.cur_block, block_size)?;
+            self.rows.extend(parse_block(&block, &self.col_types));
+            self.cur_block += 1;
         }
         
-        self.cur_block += blocks_to_read;
         self.row_idx = 0;
         Ok(true)
     }
@@ -1673,7 +1667,7 @@ fn spill_sort_merge_join_to_anon(
 // reading probe blocks AND writing to BlockWriter — no borrow conflict.
 // ── Grace Hash Join ───────────────────────────────────────────────────────────
 
-const NUM_PARTITIONS: usize = 64;
+const NUM_PARTITIONS: usize = 256;
 
 fn hash_key(key: &[u8]) -> usize {
     use std::hash::{Hash, Hasher};
@@ -1877,6 +1871,8 @@ fn extract_key(
     key_bytes
 }
 
+
+
 fn partition_both_sides(
     cross_data:   &CrossData,
     equi_pairs:   &[(String, String)],
@@ -1888,55 +1884,49 @@ fn partition_both_sides(
     block_size:   u64,
     allocator:    &mut AnonAllocator,
 ) -> Result<([(u64, u64); NUM_PARTITIONS], [(u64, u64); NUM_PARTITIONS])> {
-    // Allocate block IDs for all partition writers upfront
-    // Each partition writer starts at a pre-allocated position
-    // We use a large sparse region — disk simulator allocates lazily
-    // Allocate block IDs for all partition writers upfront
+    
     let left_partition_starts: Vec<u64> = (0..NUM_PARTITIONS)
-        .map(|_| { let s = allocator.next; allocator.next += 600_000; s }) // Increased to 100k
-        .collect();
+        .map(|_| { let s = allocator.next; allocator.next += 15_000; s }).collect();
     let right_partition_starts: Vec<u64> = (0..NUM_PARTITIONS)
-        .map(|_| { let s = allocator.next; allocator.next += 600_000; s }) // Increased to 100k
-        .collect();
+        .map(|_| { let s = allocator.next; allocator.next += 15_000; s }).collect();
 
-    // Partition left side
+    // 1. Partition Left Side and Collect Hashes
     let mut left_writers: Vec<BlockWriter> = left_partition_starts.iter()
-        .map(|&s| BlockWriter::new(block_size, s))
-        .collect();
+        .map(|&s| BlockWriter::new(block_size, s)).collect();
+    let mut valid_left_hashes: Vec<usize> = Vec::new();
 
     partition_op(
         &cross_data.left, equi_pairs, true, left_schema,
         ctx, disk_out, disk_in, block_size, allocator, &mut left_writers,
+        Some(&mut valid_left_hashes), None // Collect hashes here
     )?;
 
-    // Flush left writers and record (start, num_blocks)
     let mut left_parts = [(0u64, 0u64); NUM_PARTITIONS];
     for (i, writer) in left_writers.into_iter().enumerate() {
         let (sb, nb) = writer.finish(disk_out)?;
         left_parts[i] = (sb, nb);
-        // Update allocator to actual usage
-        if nb > 0 {
-            allocator.next = allocator.next.max(sb + nb);
-        }
+        if nb > 0 { allocator.next = allocator.next.max(sb + nb); }
     }
 
-    // Partition right side
+    // 2. Sort and deduplicate for lightning-fast binary searches
+    valid_left_hashes.sort_unstable();
+    valid_left_hashes.dedup();
+
+    // 3. Partition Right Side and Filter out wasted rows!
     let mut right_writers: Vec<BlockWriter> = right_partition_starts.iter()
-        .map(|&s| BlockWriter::new(block_size, s))
-        .collect();
+        .map(|&s| BlockWriter::new(block_size, s)).collect();
 
     partition_op(
         &cross_data.right, equi_pairs, false, right_schema,
         ctx, disk_out, disk_in, block_size, allocator, &mut right_writers,
+        None, Some(&valid_left_hashes) // Filter hashes here
     )?;
 
     let mut right_parts = [(0u64, 0u64); NUM_PARTITIONS];
     for (i, writer) in right_writers.into_iter().enumerate() {
         let (sb, nb) = writer.finish(disk_out)?;
         right_parts[i] = (sb, nb);
-        if nb > 0 {
-            allocator.next = allocator.next.max(sb + nb);
-        }
+        if nb > 0 { allocator.next = allocator.next.max(sb + nb); }
     }
 
     Ok((left_parts, right_parts))
@@ -1953,26 +1943,22 @@ fn partition_op(
     block_size:  u64,
     allocator:   &mut AnonAllocator,
     writers:     &mut Vec<BlockWriter>,
+    mut collect_hashes: Option<&mut Vec<usize>>,
+    filter_hashes: Option<&[usize]>,
 ) -> Result<()> {
-    // Fast path: pipeline
     if let Some(pipeline) = try_flatten(op) {
         return partition_pipeline(&pipeline, equi_pairs, is_left, schema,
-            ctx, disk_out, disk_in, block_size, writers);
+            ctx, disk_out, disk_in, block_size, writers, collect_hashes, filter_hashes);
     }
 
-    // Special case: Cross(pipeline, pipeline) — load right in RAM, stream left
     if let QueryOp::Cross(c) = op {
-        if let (Some(left_pipe), Some(right_pipe)) =
-            (try_flatten(&c.left), try_flatten(&c.right))
-        {
+        if let (Some(left_pipe), Some(right_pipe)) = (try_flatten(&c.left), try_flatten(&c.right)) {
             return partition_cross_pipelines(
                 &left_pipe, &right_pipe, equi_pairs, is_left,
-                ctx, disk_out, disk_in, block_size, writers);
+                ctx, disk_out, disk_in, block_size, writers, collect_hashes, filter_hashes);
         }
     }
 
-    // General case: spill op to anon disk first, then read back and partition
-    // This avoids holding large intermediate results in RAM
     let (spill_start, spill_num, spill_schema) =
         spill_hash_join_to_anon_generic(op, ctx, disk_out, disk_in, block_size, allocator)?;
 
@@ -1982,7 +1968,20 @@ fn partition_op(
         let block = disk_read_block(disk_out, disk_in, spill_start + i, block_size)?;
         for row in parse_block(&block, &col_types) {
             let key = extract_key(&row, &spill_schema, equi_pairs, is_left);
-            let p = hash_key(&key);
+            
+            use std::hash::{Hash, Hasher};
+            use std::collections::hash_map::DefaultHasher;
+            let mut hasher = DefaultHasher::new();
+            key.hash(&mut hasher);
+            let full_hash = hasher.finish() as usize;
+
+            // Semi-Join Logic
+            if let Some(ref mut c) = collect_hashes { c.push(full_hash); }
+            if let Some(f) = filter_hashes {
+                if f.binary_search(&full_hash).is_err() { continue; } // Drop row if no match!
+            }
+
+            let p = full_hash % NUM_PARTITIONS;
             writers[p].push(&row, disk_out)?;
         }
     }
@@ -2000,12 +1999,11 @@ fn partition_cross_pipelines(
     disk_in:    &mut (impl BufRead + Read),
     block_size: u64,
     writers:    &mut Vec<BlockWriter>,
+    mut collect_hashes: Option<&mut Vec<usize>>,
+    filter_hashes: Option<&[usize]>,
 ) -> Result<()> {
-    let right_table = ctx.get_table_specs().iter()
-        .find(|t| t.name == right_pipe.scan.table_id)
-        .with_context(|| format!("Table '{}' not found", right_pipe.scan.table_id))?;
-    let right_base: Schema = right_table.column_specs.iter()
-        .map(|c| (c.column_name.clone(), c.data_type.clone())).collect();
+    let right_table = ctx.get_table_specs().iter().find(|t| t.name == right_pipe.scan.table_id).unwrap();
+    let right_base: Schema = right_table.column_specs.iter().map(|c| (c.column_name.clone(), c.data_type.clone())).collect();
     let right_types: Vec<DataType> = right_base.iter().map(|(_,t)| t.clone()).collect();
     let right_out = pipeline_output_schema(&right_base, right_pipe);
     let rs = disk_get_file_start(disk_out, disk_in, &right_table.file_id)?;
@@ -2020,15 +2018,11 @@ fn partition_cross_pipelines(
         }
     }
 
-    let left_table = ctx.get_table_specs().iter()
-        .find(|t| t.name == left_pipe.scan.table_id)
-        .with_context(|| format!("Table '{}' not found", left_pipe.scan.table_id))?;
-    let left_base: Schema = left_table.column_specs.iter()
-        .map(|c| (c.column_name.clone(), c.data_type.clone())).collect();
+    let left_table = ctx.get_table_specs().iter().find(|t| t.name == left_pipe.scan.table_id).unwrap();
+    let left_base: Schema = left_table.column_specs.iter().map(|c| (c.column_name.clone(), c.data_type.clone())).collect();
     let left_types: Vec<DataType> = left_base.iter().map(|(_,t)| t.clone()).collect();
     let left_out = pipeline_output_schema(&left_base, left_pipe);
-    let combined_schema: Schema = left_out.iter()
-        .chain(right_out.iter()).cloned().collect();
+    let combined_schema: Schema = left_out.iter().chain(right_out.iter()).cloned().collect();
     let ls = disk_get_file_start(disk_out, disk_in, &left_table.file_id)?;
     let ln = disk_get_file_num_blocks(disk_out, disk_in, &left_table.file_id)?;
 
@@ -2041,7 +2035,19 @@ fn partition_cross_pipelines(
                 let mut combined = l.clone();
                 combined.extend_from_slice(r);
                 let key = extract_key(&combined, &combined_schema, equi_pairs, is_left);
-                let p = hash_key(&key);
+                
+                use std::hash::{Hash, Hasher};
+                use std::collections::hash_map::DefaultHasher;
+                let mut hasher = DefaultHasher::new();
+                key.hash(&mut hasher);
+                let full_hash = hasher.finish() as usize;
+
+                if let Some(ref mut c) = collect_hashes { c.push(full_hash); }
+                if let Some(f) = filter_hashes {
+                    if f.binary_search(&full_hash).is_err() { continue; }
+                }
+
+                let p = full_hash % NUM_PARTITIONS;
                 writers[p].push(&combined, disk_out)?;
             }
         }
@@ -2059,17 +2065,14 @@ fn partition_pipeline(
     disk_in:     &mut (impl BufRead + Read),
     block_size:  u64,
     writers:     &mut Vec<BlockWriter>,
+    mut collect_hashes: Option<&mut Vec<usize>>,
+    filter_hashes: Option<&[usize]>,
 ) -> Result<()> {
-    let table = ctx.get_table_specs().iter()
-        .find(|t| t.name == pipeline.scan.table_id)
-        .with_context(|| format!("Table '{}' not found", pipeline.scan.table_id))?;
-
-    let base_schema: Schema = table.column_specs.iter()
-        .map(|c| (c.column_name.clone(), c.data_type.clone())).collect();
+    let table = ctx.get_table_specs().iter().find(|t| t.name == pipeline.scan.table_id).unwrap();
+    let base_schema: Schema = table.column_specs.iter().map(|c| (c.column_name.clone(), c.data_type.clone())).collect();
     let col_types: Vec<DataType> = base_schema.iter().map(|(_, t)| t.clone()).collect();
     let out_schema = pipeline_output_schema(&base_schema, pipeline);
     let (pre_filters, post_filters) = split_filters_by_schema(&pipeline.filters, &base_schema);
-
     let start = disk_get_file_start(disk_out, disk_in, &table.file_id)?;
     let num   = disk_get_file_num_blocks(disk_out, disk_in, &table.file_id)?;
 
@@ -2079,9 +2082,22 @@ fn partition_pipeline(
             if !passes_all_filters(&row, &base_schema, &pre_filters) { continue; }
             let final_row = apply_project_chain(row, &base_schema, &pipeline.projects);
             if !passes_all_filters(&final_row, &out_schema, &post_filters) { continue; }
+            
             let key = extract_key(&final_row, &out_schema, equi_pairs, is_left);
-            let p = hash_key(&key);
-            // Write to partition writer — disk_out used sequentially, no borrow conflict
+            
+            use std::hash::{Hash, Hasher};
+            use std::collections::hash_map::DefaultHasher;
+            let mut hasher = DefaultHasher::new();
+            key.hash(&mut hasher);
+            let full_hash = hasher.finish() as usize;
+
+            // Semi-Join Logic
+            if let Some(ref mut c) = collect_hashes { c.push(full_hash); }
+            if let Some(f) = filter_hashes {
+                if f.binary_search(&full_hash).is_err() { continue; } // Drop row!
+            }
+
+            let p = full_hash % NUM_PARTITIONS;
             writers[p].push(&final_row, disk_out)?;
         }
     }
@@ -2518,11 +2534,10 @@ impl RunState {
     fn advance(&mut self, disk_out: &mut impl Write, disk_in: &mut (impl BufRead+Read),
                block_size: u64, col_types: &[DataType]) -> Result<()> {
         self.rows.pop_front();
-        
         if self.rows.is_empty() && self.cur_block < self.num_blocks {
-            // Read up to 16 blocks at once to eliminate seek thrashing
             let blocks_to_read = 16.min(self.num_blocks - self.cur_block);
             for _ in 0..blocks_to_read {
+                // Back to '1' block per command
                 let block = disk_read_block(disk_out, disk_in, self.start_block + self.cur_block, block_size)?;
                 self.rows.extend(parse_block(&block, col_types));
                 self.cur_block += 1; 
