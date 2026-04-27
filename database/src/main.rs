@@ -1881,7 +1881,7 @@ impl HashFilter {
     
     fn push(&mut self, hash: usize) {
         if self.aborted { return; }
-        if self.hashes.len() > 500_000 { // 4MB memory cap!
+        if self.hashes.len() > 2_000_000 { // 4MB memory cap!
             self.aborted = true;
             self.hashes.clear();
             self.hashes.shrink_to_fit(); // Instantly return RAM to the OS
@@ -1920,43 +1920,70 @@ fn partition_both_sides(
     let right_partition_starts: Vec<u64> = (0..NUM_PARTITIONS)
         .map(|_| { let s = allocator.next; allocator.next += 15_000; s }).collect();
 
-    // 1. Partition Left Side and safely collect hashes
     let mut left_writers: Vec<BlockWriter> = left_partition_starts.iter()
         .map(|&s| BlockWriter::new(block_size, s)).collect();
-        
-    let mut hash_filter = HashFilter::new();
-
-    partition_op(
-        &cross_data.left, equi_pairs, true, left_schema,
-        ctx, disk_out, disk_in, block_size, allocator, &mut left_writers,
-        Some(&mut hash_filter), None 
-    )?;
-
-    let mut left_parts = [(0u64, 0u64); NUM_PARTITIONS];
-    for (i, writer) in left_writers.into_iter().enumerate() {
-        let (sb, nb) = writer.finish(disk_out)?;
-        left_parts[i] = (sb, nb);
-        if nb > 0 { allocator.next = allocator.next.max(sb + nb); }
-    }
-
-    // Sort/dedup hashes (or do nothing if aborted due to size)
-    hash_filter.finish();
-
-    // 2. Partition Right Side and Filter!
     let mut right_writers: Vec<BlockWriter> = right_partition_starts.iter()
         .map(|&s| BlockWriter::new(block_size, s)).collect();
 
-    partition_op(
-        &cross_data.right, equi_pairs, false, right_schema,
-        ctx, disk_out, disk_in, block_size, allocator, &mut right_writers,
-        None, Some(&hash_filter) 
-    )?;
-
+    let mut hash_filter = HashFilter::new();
+    let mut left_parts = [(0u64, 0u64); NUM_PARTITIONS];
     let mut right_parts = [(0u64, 0u64); NUM_PARTITIONS];
-    for (i, writer) in right_writers.into_iter().enumerate() {
-        let (sb, nb) = writer.finish(disk_out)?;
-        right_parts[i] = (sb, nb);
-        if nb > 0 { allocator.next = allocator.next.max(sb + nb); }
+
+    // DYNAMIC SIZING: Determine which side is smaller
+    let left_card = estimate_scan_cardinality(&cross_data.left, ctx);
+    let right_card = estimate_scan_cardinality(&cross_data.right, ctx);
+    let build_left = left_card <= right_card;
+
+    if build_left {
+        // Left is smaller -> Build Filter from Left, Probe Right
+        partition_op(
+            &cross_data.left, equi_pairs, true, left_schema,
+            ctx, disk_out, disk_in, block_size, allocator, &mut left_writers,
+            Some(&mut hash_filter), None 
+        )?;
+        for (i, writer) in left_writers.into_iter().enumerate() {
+            let (sb, nb) = writer.finish(disk_out)?;
+            left_parts[i] = (sb, nb);
+            if nb > 0 { allocator.next = allocator.next.max(sb + nb); }
+        }
+
+        hash_filter.finish();
+
+        partition_op(
+            &cross_data.right, equi_pairs, false, right_schema,
+            ctx, disk_out, disk_in, block_size, allocator, &mut right_writers,
+            None, Some(&hash_filter) 
+        )?;
+        for (i, writer) in right_writers.into_iter().enumerate() {
+            let (sb, nb) = writer.finish(disk_out)?;
+            right_parts[i] = (sb, nb);
+            if nb > 0 { allocator.next = allocator.next.max(sb + nb); }
+        }
+    } else {
+        // Right is smaller -> Build Filter from Right, Probe Left
+        partition_op(
+            &cross_data.right, equi_pairs, false, right_schema,
+            ctx, disk_out, disk_in, block_size, allocator, &mut right_writers,
+            Some(&mut hash_filter), None 
+        )?;
+        for (i, writer) in right_writers.into_iter().enumerate() {
+            let (sb, nb) = writer.finish(disk_out)?;
+            right_parts[i] = (sb, nb);
+            if nb > 0 { allocator.next = allocator.next.max(sb + nb); }
+        }
+
+        hash_filter.finish();
+
+        partition_op(
+            &cross_data.left, equi_pairs, true, left_schema,
+            ctx, disk_out, disk_in, block_size, allocator, &mut left_writers,
+            None, Some(&hash_filter) 
+        )?;
+        for (i, writer) in left_writers.into_iter().enumerate() {
+            let (sb, nb) = writer.finish(disk_out)?;
+            left_parts[i] = (sb, nb);
+            if nb > 0 { allocator.next = allocator.next.max(sb + nb); }
+        }
     }
 
     Ok((left_parts, right_parts))
