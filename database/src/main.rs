@@ -67,13 +67,16 @@ impl BlockWriter {
 
     fn flush_pending(&mut self, disk_out: &mut impl Write) -> Result<()> {
         if self.pending.is_empty() { return Ok(()); }
+        // Write all pending blocks in a single multi-block put to avoid
+        // per-block command overhead and ensure contiguous writes are atomic
+        let count = self.pending.len() as u64;
+        let id = self.start_block + self.num_blocks;
+        disk_out.write_all(format!("put block {} {}\n", id, count).as_bytes())?;
         for p_block in &self.pending {
-            let id = self.start_block + self.num_blocks;
-            disk_out.write_all(format!("put block {} 1\n", id).as_bytes())?;
             disk_out.write_all(p_block)?;
-            self.num_blocks += 1;
         }
         disk_out.flush()?;
+        self.num_blocks += count;
         self.pending.clear();
         Ok(())
     }
