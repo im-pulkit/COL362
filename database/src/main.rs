@@ -615,7 +615,7 @@ fn estimate_join_cost(
 
     // 2. Smaller side fits in RAM? Exec engine chooses Simple Hash
     let min_card = left_card.min(right_card);
-    if min_card <= 50000 {
+    if min_card <= 100000 {
         return (cost_hash_join_simple(left_blocks, right_blocks), "hash_join_simple");
     }
 
@@ -1522,7 +1522,7 @@ fn exec_cross(
         let right_card = estimate_scan_cardinality(&cross_data.right, ctx);
         let min_card   = left_card.min(right_card);
 
-        if min_card <= 50000 && try_flatten(&cross_data.left).is_some() 
+        if min_card <= 100000 && try_flatten(&cross_data.left).is_some() 
                             && try_flatten(&cross_data.right).is_some() {
             return exec_simple_hash_join(
                 cross_data, join_predicates,
@@ -2417,7 +2417,7 @@ fn spill_hash_join_to_anon_generic(
             let lp = try_flatten(&c.left).is_some();
             let rp = try_flatten(&c.right).is_some();
 
-            if lp && rp && left_card.min(right_card) <= 50000 {
+            if lp && rp && left_card.min(right_card) <= 100000 {
                 return spill_simple_hash_join_to_anon(
                     c, &f.predicates,
                     ctx, disk_out, disk_in, block_size, allocator,
