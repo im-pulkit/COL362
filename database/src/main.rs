@@ -2466,45 +2466,65 @@ fn merge_runs(
     block_size: u64,
     emit:       &mut dyn FnMut(Row, &Schema) -> Result<()>,
 ) -> Result<()> {
-    let col_types: Vec<DataType> = schema.iter().map(|(_, t)| t.clone()).collect();
-    let mut states: Vec<RunState> = Vec::with_capacity(runs.len());
+    use std::collections::BinaryHeap;
 
+    let col_types: Vec<DataType> = schema.iter().map(|(_, t)| t.clone()).collect();
+
+    // Pre-compile sort spec indices once
+    let comp_sort: Vec<(usize, bool)> = sort_data.sort_specs.iter()
+        .map(|s| (schema.iter().position(|(n,_)| n == &s.column_name).unwrap(), s.ascending))
+        .collect();
+
+    struct HeapEntry {
+        row:       Row,
+        run_idx:   usize,
+        comp_sort: *const Vec<(usize, bool)>,
+    }
+    impl PartialEq for HeapEntry {
+        fn eq(&self, other: &Self) -> bool { self.cmp(other) == std::cmp::Ordering::Equal }
+    }
+    impl Eq for HeapEntry {}
+    impl PartialOrd for HeapEntry {
+        fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> { Some(self.cmp(other)) }
+    }
+    impl Ord for HeapEntry {
+        fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+            let specs = unsafe { &*self.comp_sort };
+            // REVERSED: BinaryHeap is max-heap, we want min
+            for &(i, ascending) in specs {
+                let ord = other.row[i].partial_cmp(&self.row[i]).unwrap_or(std::cmp::Ordering::Equal);
+                let ord = if ascending { ord } else { ord.reverse() };
+                if ord != std::cmp::Ordering::Equal { return ord; }
+            }
+            std::cmp::Ordering::Equal
+        }
+    }
+
+    let mut states: Vec<RunState> = Vec::with_capacity(runs.len());
     for (rs, rn) in &runs {
         if *rn == 0 { continue; }
-        
         let mut state = RunState {
-            start_block: *rs, 
-            num_blocks: *rn,
-            cur_block: 0, 
-            rows: std::collections::VecDeque::new(),
+            start_block: *rs, num_blocks: *rn,
+            cur_block: 0, rows: std::collections::VecDeque::new(),
         };
-        
-        // Pre-load the first 16 blocks using the new buffered advance logic
         state.advance(disk_out, disk_in, block_size, &col_types)?;
-        
         states.push(state);
     }
 
-    loop {
-        let mut min_idx: Option<usize> = None;
-        for (i, state) in states.iter().enumerate() {
-            if state.peek().is_none() { continue; }
-            match min_idx {
-                None    => min_idx = Some(i),
-                Some(j) => {
-                    if compare_rows(
-                        state.peek().unwrap(), states[j].peek().unwrap(),
-                        schema, &sort_data.sort_specs,
-                    ) == std::cmp::Ordering::Less {
-                        min_idx = Some(i);
-                    }
-                }
-            }
+    let mut heap: BinaryHeap<HeapEntry> = BinaryHeap::with_capacity(states.len());
+    for (i, state) in states.iter().enumerate() {
+        if let Some(row) = state.peek() {
+            heap.push(HeapEntry { row: row.clone(), run_idx: i, comp_sort: &comp_sort });
         }
-        let Some(idx) = min_idx else { break; };
-        let row = states[idx].peek().unwrap().clone();
-        emit(row, schema)?;
-        states[idx].advance(disk_out, disk_in, block_size, &col_types)?;
+    }
+
+    while let Some(entry) = heap.pop() {
+        emit(entry.row, schema)?;
+        let i = entry.run_idx;
+        states[i].advance(disk_out, disk_in, block_size, &col_types)?;
+        if let Some(row) = states[i].peek() {
+            heap.push(HeapEntry { row: row.clone(), run_idx: i, comp_sort: &comp_sort });
+        }
     }
     Ok(())
 }
@@ -2864,12 +2884,84 @@ fn reorder_joins(op: QueryOp, ctx: &DbContext) -> QueryOp {
         other => other,
     }
 }
+fn push_project_past_sort(op: QueryOp, ctx: &DbContext) -> QueryOp {
+    match op {
+        QueryOp::Project(p) => {
+            match *p.underlying {
+                QueryOp::Sort(s) => {
+                    let child_schema = schema_of(&s.underlying, ctx);
+
+                    // Columns needed by outer project (source names)
+                    let mut needed: Vec<String> = p.column_name_map.iter()
+                        .map(|(from, _)| from.clone())
+                        .collect();
+
+                    // Columns needed by sort keys
+                    for spec in &s.sort_specs {
+                        if !needed.contains(&spec.column_name) {
+                            needed.push(spec.column_name.clone());
+                        }
+                    }
+
+                    // Only push down if it actually reduces column count
+                    if needed.len() < child_schema.len() {
+                        let early_map: Vec<(String, String)> = needed.iter()
+                            .filter(|n| child_schema.iter().any(|(cn, _)| cn == *n))
+                            .map(|n| (n.clone(), n.clone()))
+                            .collect();
+
+                        let early_proj = QueryOp::Project(ProjectData {
+                            column_name_map: early_map,
+                            underlying: Box::new(
+                                push_project_past_sort(*s.underlying, ctx)
+                            ),
+                        });
+
+                        let new_sort = QueryOp::Sort(SortData {
+                            sort_specs: s.sort_specs,
+                            underlying: Box::new(early_proj),
+                        });
+
+                        QueryOp::Project(ProjectData {
+                            column_name_map: p.column_name_map,
+                            underlying: Box::new(new_sort),
+                        })
+                    } else {
+                        QueryOp::Project(ProjectData {
+                            column_name_map: p.column_name_map,
+                            underlying: Box::new(
+                                push_project_past_sort(QueryOp::Sort(s), ctx)
+                            ),
+                        })
+                    }
+                }
+                other => QueryOp::Project(ProjectData {
+                    column_name_map: p.column_name_map,
+                    underlying: Box::new(push_project_past_sort(other, ctx)),
+                }),
+            }
+        }
+        QueryOp::Sort(s) => QueryOp::Sort(SortData {
+            sort_specs: s.sort_specs,
+            underlying: Box::new(push_project_past_sort(*s.underlying, ctx)),
+        }),
+        QueryOp::Filter(f) => QueryOp::Filter(FilterData {
+            predicates: f.predicates,
+            underlying: Box::new(push_project_past_sort(*f.underlying, ctx)),
+        }),
+        QueryOp::Cross(c) => QueryOp::Cross(CrossData {
+            left:  Box::new(push_project_past_sort(*c.left, ctx)),
+            right: Box::new(push_project_past_sort(*c.right, ctx)),
+        }),
+        QueryOp::Scan(_) => op,
+    }
+}
 
 fn optimize(op: QueryOp, ctx: &DbContext) -> QueryOp {
-    // Step 1: reorder joins on raw tree BEFORE pushing predicates down
     let op = reorder_joins(op, ctx);
-    // Step 2: push predicates down on reordered tree
-    push_down_pass(op, ctx)
+    let op = push_down_pass(op, ctx);
+    // Step 3: push project inside sort — sort only materializes needed columns
+    push_project_past_sort(op, ctx)
 }
 
 fn push_down_pass(op: QueryOp, ctx: &DbContext) -> QueryOp {
