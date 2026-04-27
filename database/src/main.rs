@@ -189,6 +189,16 @@ fn serialize_row_bytes(row: &Row) -> Vec<u8> {
     b
 }
 
+fn serialize_val_into_buf(val: &Data, buf: &mut Vec<u8>) {
+    match val {
+        Data::Int32(x)   => buf.extend_from_slice(&x.to_le_bytes()),
+        Data::Int64(x)   => buf.extend_from_slice(&x.to_le_bytes()),
+        Data::Float32(x) => buf.extend_from_slice(&x.to_le_bytes()),
+        Data::Float64(x) => buf.extend_from_slice(&x.to_le_bytes()),
+        Data::String(s)  => { buf.extend_from_slice(s.as_bytes()); buf.push(0); }
+    }
+}
+
 fn approx_row_size(row: &Row) -> usize {
     // Vec<Data> overhead + per-element overhead
     let base = 24; // Vec struct
@@ -1598,6 +1608,8 @@ fn spill_sort_merge_join_to_anon(
     block_size:    u64,
     allocator:     &mut AnonAllocator,
 ) -> Result<(u64, u64, Schema)> {
+    // Pre-calculate indices ONCE, completely killing the string search!
+    
     let left_pipeline  = try_flatten(&cross_data.left).expect("sort-merge spill: left must be pipeline");
     let right_pipeline = try_flatten(&cross_data.right).expect("sort-merge spill: right must be pipeline");
 
@@ -1609,12 +1621,20 @@ fn spill_sort_merge_join_to_anon(
     let right_key_idx = col_idx(&right.out_schema, right_join_col);
 
     let out_schema = if let Some(p) = project { project_schema(&combined_schema, p) } else { combined_schema.clone() };
+    
+    
 
     left.init(disk_out, disk_in, block_size)?;
     right.init(disk_out, disk_in, block_size)?;
 
     let anon_start = allocator.next;
     let mut writer = BlockWriter::new(block_size, anon_start);
+    let proj_indices: Option<Vec<usize>> = project.map(|p| {
+        p.column_name_map.iter().map(|(from, _)| col_idx(&combined_schema, from)).collect()
+    });
+    
+    // A reusable buffer for the final output
+    let mut out_row_buf = Vec::with_capacity(256);
 
     loop {
         if left.is_exhausted() || right.is_exhausted() { break; }
@@ -1645,8 +1665,13 @@ fn spill_sort_merge_join_to_anon(
                         let mut combined = l.clone();
                         combined.extend_from_slice(r);
                         if theta.iter().all(|p| eval_predicate(&combined, &combined_schema, p)) {
-                            let final_row = if let Some(p) = project { project_row(&combined, &combined_schema, p) } else { combined };
-                            writer.push_bytes(&serialize_row_bytes(&final_row), disk_out)?;
+                            out_row_buf.clear();
+                            if let Some(ref indices) = proj_indices {
+                                for &idx in indices { serialize_val_into_buf(&combined[idx], &mut out_row_buf); }
+                            } else {
+                                for val in &combined { serialize_val_into_buf(val, &mut out_row_buf); }
+                            }
+                            writer.push_bytes(&out_row_buf, disk_out)?;
                         }
                     }
                     left.advance(disk_out, disk_in, block_size)?;
@@ -1753,11 +1778,15 @@ fn spill_grace_hash_join_to_anon(
     block_size:       u64,
     allocator:        &mut AnonAllocator,
 ) -> Result<(u64, u64, Schema)> {
+    // Pre-calculate indices ONCE, completely killing the string search!
+    
     let (left_schema, right_schema, combined_schema, equi_pairs, theta) =
         prepare_join_metadata(cross_data, join_predicates, ctx);
 
     // Apply projection to the schema
     let out_schema = if let Some(p) = project { project_schema(&combined_schema, p) } else { combined_schema.clone() };
+
+    
 
     let (left_parts, right_parts) = partition_both_sides(
         cross_data, &equi_pairs, &left_schema, &right_schema,
@@ -1768,6 +1797,13 @@ fn spill_grace_hash_join_to_anon(
     let mut out_writer = BlockWriter::new(block_size, out_start);
     let left_col_types:  Vec<DataType> = left_schema.iter().map(|(_, t)| t.clone()).collect();
     let right_col_types: Vec<DataType> = right_schema.iter().map(|(_, t)| t.clone()).collect();
+
+    let proj_indices: Option<Vec<usize>> = project.map(|p| {
+        p.column_name_map.iter().map(|(from, _)| col_idx(&combined_schema, from)).collect()
+    });
+    
+    // A reusable buffer for the final output
+    let mut out_row_buf = Vec::with_capacity(256);
 
     for p in 0..NUM_PARTITIONS {
         let (ls, ln) = left_parts[p];
@@ -1795,9 +1831,13 @@ fn spill_grace_hash_join_to_anon(
                         let mut combined = left_row.clone();
                         combined.extend_from_slice(right_row);
                         if theta.iter().all(|p| eval_predicate(&combined, &combined_schema, p)) {
-                            // Apply projection to the row before spilling!
-                            let final_row = if let Some(p) = project { project_row(&combined, &combined_schema, p) } else { combined };
-                            out_writer.push_bytes(&serialize_row_bytes(&final_row), disk_out)?;
+                            out_row_buf.clear();
+                            if let Some(ref indices) = proj_indices {
+                                for &idx in indices { serialize_val_into_buf(&combined[idx], &mut out_row_buf); }
+                            } else {
+                                for val in &combined { serialize_val_into_buf(val, &mut out_row_buf); }
+                            }
+                            out_writer.push_bytes(&out_row_buf, disk_out)?;
                         }
                     }
                 }
@@ -2147,8 +2187,11 @@ fn spill_simple_hash_join_to_anon(
     block_size:      u64,
     allocator:       &mut AnonAllocator,
 ) -> Result<(u64, u64, Schema)> {
+    
     let (left_schema, right_schema, combined_schema, equi_pairs, theta) =
         prepare_join_metadata(cross_data, join_predicates, ctx);
+
+    
 
     let left_card  = estimate_scan_cardinality(&cross_data.left, ctx);
     let right_card = estimate_scan_cardinality(&cross_data.right, ctx);
@@ -2203,6 +2246,10 @@ fn spill_simple_hash_join_to_anon(
     
     let out_start = allocator.next;
     let mut writer = BlockWriter::new(block_size, out_start);
+    let proj_indices: Option<Vec<usize>> = project.map(|p| {
+        p.column_name_map.iter().map(|(from, _)| col_idx(&combined_schema_final, from)).collect()
+    });
+    let mut out_row_buf = Vec::with_capacity(256);
     let mut probe_key_buf = Vec::with_capacity(128);
 
     for i in 0..pn {
@@ -2222,8 +2269,13 @@ fn spill_simple_hash_join_to_anon(
                         let mut c = build_row.clone(); c.extend_from_slice(&probe_row); c
                     };
                     if theta.iter().all(|p| eval_predicate(&combined, &combined_schema_final, p)) {
-                        let final_row = if let Some(p) = project { project_row(&combined, &combined_schema_final, p) } else { combined };
-                        writer.push_bytes(&serialize_row_bytes(&final_row), disk_out)?;
+                        out_row_buf.clear();
+                        if let Some(ref indices) = proj_indices {
+                            for &idx in indices { serialize_val_into_buf(&combined[idx], &mut out_row_buf); }
+                        } else {
+                            for val in &combined { serialize_val_into_buf(val, &mut out_row_buf); }
+                        }
+                        writer.push_bytes(&out_row_buf, disk_out)?;
                     }
                 }
             }
