@@ -556,6 +556,7 @@ fn estimate_subset_cardinality(
 }
 
 /// Estimate the I/O cost of executing a join with a given algorithm
+
 fn estimate_join_cost(
     left_blocks:  u64,
     right_blocks: u64,
@@ -565,42 +566,26 @@ fn estimate_join_cost(
     right_ordered_on_join_key: bool,
     has_equi_pred: bool,
 ) -> (f64, &'static str) {
-    let mut best = (f64::INFINITY, "nested_loop");
-
-    // Always available: nested loop (worst case)
-    let nlj = cost_nested_loop(left_blocks, right_blocks, left_card);
-    if nlj < best.0 { best = (nlj, "nested_loop"); }
-
-    // Block nested loop — always better than NLJ
-    let bnl = cost_block_nl(left_blocks, right_blocks);
-    if bnl < best.0 { best = (bnl, "block_nested_loop"); }
-
-    if has_equi_pred {
-        // Hash join (in-memory if smaller side fits)
-        let smaller = left_blocks.min(right_blocks);
-        if smaller <= MEMORY_BLOCKS {
-            let hj = cost_hash_join_simple(left_blocks, right_blocks);
-            if hj < best.0 { best = (hj, "hash_join_simple"); }
-        }
-
-        // Grace hash join (always available for equi)
-        let ghj = cost_hash_join_grace(left_blocks, right_blocks);
-        if ghj < best.0 { best = (ghj, "hash_join_grace"); }
-
-        // Sort-merge join
-        let smj = if left_ordered_on_join_key && right_ordered_on_join_key {
-            cost_sort_merge_ordered(left_blocks, right_blocks)
-        } else {
-            cost_sort_merge_with_sort(
-                left_blocks, right_blocks,
-                !left_ordered_on_join_key, !right_ordered_on_join_key,
-                MEMORY_BLOCKS,
-            )
-        };
-        if smj < best.0 { best = (smj, "sort_merge"); }
+    if !has_equi_pred {
+        // Fallback to cross nested loop if no equi-join exists
+        return (cost_nested_loop(left_blocks, right_blocks, left_card), "nested_loop");
     }
 
-    best
+    // Mirror the exact logic inside `exec_cross` so the DP costs what is ACTUALLY executed!
+    
+    // 1. Both ordered? Exec engine chooses Sort-Merge
+    if left_ordered_on_join_key && right_ordered_on_join_key {
+        return (cost_sort_merge_ordered(left_blocks, right_blocks), "sort_merge");
+    }
+
+    // 2. Smaller side fits in RAM? Exec engine chooses Simple Hash
+    let min_card = left_card.min(right_card);
+    if min_card <= 20000 {
+        return (cost_hash_join_simple(left_blocks, right_blocks), "hash_join_simple");
+    }
+
+    // 3. Otherwise, Exec engine falls back to Grace Hash
+    (cost_hash_join_grace(left_blocks, right_blocks), "hash_join_grace")
 }
 
 /// Find equi-join predicates between two sets of schemas
@@ -756,14 +741,16 @@ fn dp_optimize(
                     continue;
                 }
 
-                // Estimate join cardinality
-                // Estimate join cardinality
-                let join_card = if has_equi {
-                    // Much better heuristic for 1-to-N relationships (PK/FK)
-                    left.cardinality.max(right.cardinality)
-                } else {
-                    left.cardinality.saturating_mul(right.cardinality)
-                };
+                // Gather the actual relations present in this specific joined subset
+                let mut subset_rels = Vec::new();
+                for j in 0..n {
+                    if (mask & (1u32 << j)) != 0 {
+                        subset_rels.push(&rel_infos[j]);
+                    }
+                }
+
+                // Utilize the orphaned, highly-accurate cardinality estimator!
+                let join_card = estimate_subset_cardinality(&subset_rels, &predicates, ctx);
 
                 // Estimate cost of the join
                 let left_blocks  = (left.cardinality  / 50).max(1);
