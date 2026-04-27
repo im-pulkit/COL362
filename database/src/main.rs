@@ -1871,7 +1871,37 @@ fn extract_key(
     key_bytes
 }
 
+struct HashFilter {
+    hashes: Vec<usize>,
+    aborted: bool,
+}
 
+impl HashFilter {
+    fn new() -> Self { Self { hashes: Vec::new(), aborted: false } }
+    
+    fn push(&mut self, hash: usize) {
+        if self.aborted { return; }
+        if self.hashes.len() > 500_000 { // 4MB memory cap!
+            self.aborted = true;
+            self.hashes.clear();
+            self.hashes.shrink_to_fit(); // Instantly return RAM to the OS
+        } else {
+            self.hashes.push(hash);
+        }
+    }
+    
+    fn finish(&mut self) {
+        if !self.aborted {
+            self.hashes.sort_unstable();
+            self.hashes.dedup();
+        }
+    }
+    
+    fn contains(&self, hash: usize) -> bool {
+        if self.aborted { true } // If aborted, everything "matches" (filter disabled)
+        else { self.hashes.binary_search(&hash).is_ok() }
+    }
+}
 
 fn partition_both_sides(
     cross_data:   &CrossData,
@@ -1890,15 +1920,16 @@ fn partition_both_sides(
     let right_partition_starts: Vec<u64> = (0..NUM_PARTITIONS)
         .map(|_| { let s = allocator.next; allocator.next += 15_000; s }).collect();
 
-    // 1. Partition Left Side and Collect Hashes
+    // 1. Partition Left Side and safely collect hashes
     let mut left_writers: Vec<BlockWriter> = left_partition_starts.iter()
         .map(|&s| BlockWriter::new(block_size, s)).collect();
-    let mut valid_left_hashes: Vec<usize> = Vec::new();
+        
+    let mut hash_filter = HashFilter::new();
 
     partition_op(
         &cross_data.left, equi_pairs, true, left_schema,
         ctx, disk_out, disk_in, block_size, allocator, &mut left_writers,
-        Some(&mut valid_left_hashes), None // Collect hashes here
+        Some(&mut hash_filter), None 
     )?;
 
     let mut left_parts = [(0u64, 0u64); NUM_PARTITIONS];
@@ -1908,18 +1939,17 @@ fn partition_both_sides(
         if nb > 0 { allocator.next = allocator.next.max(sb + nb); }
     }
 
-    // 2. Sort and deduplicate for lightning-fast binary searches
-    valid_left_hashes.sort_unstable();
-    valid_left_hashes.dedup();
+    // Sort/dedup hashes (or do nothing if aborted due to size)
+    hash_filter.finish();
 
-    // 3. Partition Right Side and Filter out wasted rows!
+    // 2. Partition Right Side and Filter!
     let mut right_writers: Vec<BlockWriter> = right_partition_starts.iter()
         .map(|&s| BlockWriter::new(block_size, s)).collect();
 
     partition_op(
         &cross_data.right, equi_pairs, false, right_schema,
         ctx, disk_out, disk_in, block_size, allocator, &mut right_writers,
-        None, Some(&valid_left_hashes) // Filter hashes here
+        None, Some(&hash_filter) 
     )?;
 
     let mut right_parts = [(0u64, 0u64); NUM_PARTITIONS];
@@ -1943,19 +1973,19 @@ fn partition_op(
     block_size:  u64,
     allocator:   &mut AnonAllocator,
     writers:     &mut Vec<BlockWriter>,
-    mut collect_hashes: Option<&mut Vec<usize>>,
-    filter_hashes: Option<&[usize]>,
+    mut collect_filter: Option<&mut HashFilter>,
+    apply_filter: Option<&HashFilter>,
 ) -> Result<()> {
     if let Some(pipeline) = try_flatten(op) {
         return partition_pipeline(&pipeline, equi_pairs, is_left, schema,
-            ctx, disk_out, disk_in, block_size, writers, collect_hashes, filter_hashes);
+            ctx, disk_out, disk_in, block_size, writers, collect_filter, apply_filter);
     }
 
     if let QueryOp::Cross(c) = op {
         if let (Some(left_pipe), Some(right_pipe)) = (try_flatten(&c.left), try_flatten(&c.right)) {
             return partition_cross_pipelines(
                 &left_pipe, &right_pipe, equi_pairs, is_left,
-                ctx, disk_out, disk_in, block_size, writers, collect_hashes, filter_hashes);
+                ctx, disk_out, disk_in, block_size, writers, collect_filter, apply_filter);
         }
     }
 
@@ -1975,10 +2005,9 @@ fn partition_op(
             key.hash(&mut hasher);
             let full_hash = hasher.finish() as usize;
 
-            // Semi-Join Logic
-            if let Some(ref mut c) = collect_hashes { c.push(full_hash); }
-            if let Some(f) = filter_hashes {
-                if f.binary_search(&full_hash).is_err() { continue; } // Drop row if no match!
+            if let Some(ref mut c) = collect_filter { c.push(full_hash); }
+            if let Some(f) = apply_filter {
+                if !f.contains(full_hash) { continue; } 
             }
 
             let p = full_hash % NUM_PARTITIONS;
@@ -1988,7 +2017,54 @@ fn partition_op(
     Ok(())
 }
 
-// Extracted helper for Cross(pipeline, pipeline) case
+fn partition_pipeline(
+    pipeline:    &Pipeline,
+    equi_pairs:  &[(String, String)],
+    is_left:     bool,
+    _schema:     &Schema,
+    ctx:         &DbContext,
+    disk_out:    &mut impl Write,
+    disk_in:     &mut (impl BufRead + Read),
+    block_size:  u64,
+    writers:     &mut Vec<BlockWriter>,
+    mut collect_filter: Option<&mut HashFilter>,
+    apply_filter: Option<&HashFilter>,
+) -> Result<()> {
+    let table = ctx.get_table_specs().iter().find(|t| t.name == pipeline.scan.table_id).unwrap();
+    let base_schema: Schema = table.column_specs.iter().map(|c| (c.column_name.clone(), c.data_type.clone())).collect();
+    let col_types: Vec<DataType> = base_schema.iter().map(|(_, t)| t.clone()).collect();
+    let out_schema = pipeline_output_schema(&base_schema, pipeline);
+    let (pre_filters, post_filters) = split_filters_by_schema(&pipeline.filters, &base_schema);
+    let start = disk_get_file_start(disk_out, disk_in, &table.file_id)?;
+    let num   = disk_get_file_num_blocks(disk_out, disk_in, &table.file_id)?;
+
+    for i in 0..num {
+        let block = disk_read_block(disk_out, disk_in, start + i, block_size)?;
+        for row in parse_block(&block, &col_types) {
+            if !passes_all_filters(&row, &base_schema, &pre_filters) { continue; }
+            let final_row = apply_project_chain(row, &base_schema, &pipeline.projects);
+            if !passes_all_filters(&final_row, &out_schema, &post_filters) { continue; }
+            
+            let key = extract_key(&final_row, &out_schema, equi_pairs, is_left);
+            
+            use std::hash::{Hash, Hasher};
+            use std::collections::hash_map::DefaultHasher;
+            let mut hasher = DefaultHasher::new();
+            key.hash(&mut hasher);
+            let full_hash = hasher.finish() as usize;
+
+            if let Some(ref mut c) = collect_filter { c.push(full_hash); }
+            if let Some(f) = apply_filter {
+                if !f.contains(full_hash) { continue; } 
+            }
+
+            let p = full_hash % NUM_PARTITIONS;
+            writers[p].push(&final_row, disk_out)?;
+        }
+    }
+    Ok(())
+}
+
 fn partition_cross_pipelines(
     left_pipe:  &Pipeline,
     right_pipe: &Pipeline,
@@ -1999,8 +2075,8 @@ fn partition_cross_pipelines(
     disk_in:    &mut (impl BufRead + Read),
     block_size: u64,
     writers:    &mut Vec<BlockWriter>,
-    mut collect_hashes: Option<&mut Vec<usize>>,
-    filter_hashes: Option<&[usize]>,
+    mut collect_filter: Option<&mut HashFilter>,
+    apply_filter: Option<&HashFilter>,
 ) -> Result<()> {
     let right_table = ctx.get_table_specs().iter().find(|t| t.name == right_pipe.scan.table_id).unwrap();
     let right_base: Schema = right_table.column_specs.iter().map(|c| (c.column_name.clone(), c.data_type.clone())).collect();
@@ -2042,63 +2118,14 @@ fn partition_cross_pipelines(
                 key.hash(&mut hasher);
                 let full_hash = hasher.finish() as usize;
 
-                if let Some(ref mut c) = collect_hashes { c.push(full_hash); }
-                if let Some(f) = filter_hashes {
-                    if f.binary_search(&full_hash).is_err() { continue; }
+                if let Some(ref mut c) = collect_filter { c.push(full_hash); }
+                if let Some(f) = apply_filter {
+                    if !f.contains(full_hash) { continue; }
                 }
 
                 let p = full_hash % NUM_PARTITIONS;
                 writers[p].push(&combined, disk_out)?;
             }
-        }
-    }
-    Ok(())
-}
-
-fn partition_pipeline(
-    pipeline:    &Pipeline,
-    equi_pairs:  &[(String, String)],
-    is_left:     bool,
-    _schema:     &Schema,
-    ctx:         &DbContext,
-    disk_out:    &mut impl Write,
-    disk_in:     &mut (impl BufRead + Read),
-    block_size:  u64,
-    writers:     &mut Vec<BlockWriter>,
-    mut collect_hashes: Option<&mut Vec<usize>>,
-    filter_hashes: Option<&[usize]>,
-) -> Result<()> {
-    let table = ctx.get_table_specs().iter().find(|t| t.name == pipeline.scan.table_id).unwrap();
-    let base_schema: Schema = table.column_specs.iter().map(|c| (c.column_name.clone(), c.data_type.clone())).collect();
-    let col_types: Vec<DataType> = base_schema.iter().map(|(_, t)| t.clone()).collect();
-    let out_schema = pipeline_output_schema(&base_schema, pipeline);
-    let (pre_filters, post_filters) = split_filters_by_schema(&pipeline.filters, &base_schema);
-    let start = disk_get_file_start(disk_out, disk_in, &table.file_id)?;
-    let num   = disk_get_file_num_blocks(disk_out, disk_in, &table.file_id)?;
-
-    for i in 0..num {
-        let block = disk_read_block(disk_out, disk_in, start + i, block_size)?;
-        for row in parse_block(&block, &col_types) {
-            if !passes_all_filters(&row, &base_schema, &pre_filters) { continue; }
-            let final_row = apply_project_chain(row, &base_schema, &pipeline.projects);
-            if !passes_all_filters(&final_row, &out_schema, &post_filters) { continue; }
-            
-            let key = extract_key(&final_row, &out_schema, equi_pairs, is_left);
-            
-            use std::hash::{Hash, Hasher};
-            use std::collections::hash_map::DefaultHasher;
-            let mut hasher = DefaultHasher::new();
-            key.hash(&mut hasher);
-            let full_hash = hasher.finish() as usize;
-
-            // Semi-Join Logic
-            if let Some(ref mut c) = collect_hashes { c.push(full_hash); }
-            if let Some(f) = filter_hashes {
-                if f.binary_search(&full_hash).is_err() { continue; } // Drop row!
-            }
-
-            let p = full_hash % NUM_PARTITIONS;
-            writers[p].push(&final_row, disk_out)?;
         }
     }
     Ok(())
