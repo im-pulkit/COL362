@@ -69,7 +69,6 @@ impl BlockWriter {
         if self.pending.is_empty() { return Ok(()); }
         for p_block in &self.pending {
             let id = self.start_block + self.num_blocks;
-            // Back to '1' block per command so the simulator understands it
             disk_out.write_all(format!("put block {} 1\n", id).as_bytes())?;
             disk_out.write_all(p_block)?;
             self.num_blocks += 1;
@@ -134,15 +133,6 @@ fn disk_read_block(
     i.read_exact(&mut buf)?;
     Ok(buf)
 }
-fn disk_read_blocks(
-    o: &mut impl Write, i: &mut impl Read, start_block: u64, num_blocks: u64, block_size: u64,
-) -> Result<Vec<u8>> {
-    o.write_all(format!("get block {} {}\n", start_block, num_blocks).as_bytes())?;
-    o.flush()?;
-    let mut buf = vec![0u8; (block_size * num_blocks) as usize];
-    i.read_exact(&mut buf)?;
-    Ok(buf)
-}
 
 // ── Row parsing ───────────────────────────────────────────────────────────────
 
@@ -187,16 +177,6 @@ fn serialize_row_bytes(row: &Row) -> Vec<u8> {
         }
     }
     b
-}
-
-fn serialize_val_into_buf(val: &Data, buf: &mut Vec<u8>) {
-    match val {
-        Data::Int32(x)   => buf.extend_from_slice(&x.to_le_bytes()),
-        Data::Int64(x)   => buf.extend_from_slice(&x.to_le_bytes()),
-        Data::Float32(x) => buf.extend_from_slice(&x.to_le_bytes()),
-        Data::Float64(x) => buf.extend_from_slice(&x.to_le_bytes()),
-        Data::String(s)  => { buf.extend_from_slice(s.as_bytes()); buf.push(0); }
-    }
 }
 
 fn approx_row_size(row: &Row) -> usize {
@@ -576,7 +556,6 @@ fn estimate_subset_cardinality(
 }
 
 /// Estimate the I/O cost of executing a join with a given algorithm
-
 fn estimate_join_cost(
     left_blocks:  u64,
     right_blocks: u64,
@@ -586,26 +565,42 @@ fn estimate_join_cost(
     right_ordered_on_join_key: bool,
     has_equi_pred: bool,
 ) -> (f64, &'static str) {
-    if !has_equi_pred {
-        // Fallback to cross nested loop if no equi-join exists
-        return (cost_nested_loop(left_blocks, right_blocks, left_card), "nested_loop");
+    let mut best = (f64::INFINITY, "nested_loop");
+
+    // Always available: nested loop (worst case)
+    let nlj = cost_nested_loop(left_blocks, right_blocks, left_card);
+    if nlj < best.0 { best = (nlj, "nested_loop"); }
+
+    // Block nested loop — always better than NLJ
+    let bnl = cost_block_nl(left_blocks, right_blocks);
+    if bnl < best.0 { best = (bnl, "block_nested_loop"); }
+
+    if has_equi_pred {
+        // Hash join (in-memory if smaller side fits)
+        let smaller = left_blocks.min(right_blocks);
+        if smaller <= MEMORY_BLOCKS {
+            let hj = cost_hash_join_simple(left_blocks, right_blocks);
+            if hj < best.0 { best = (hj, "hash_join_simple"); }
+        }
+
+        // Grace hash join (always available for equi)
+        let ghj = cost_hash_join_grace(left_blocks, right_blocks);
+        if ghj < best.0 { best = (ghj, "hash_join_grace"); }
+
+        // Sort-merge join
+        let smj = if left_ordered_on_join_key && right_ordered_on_join_key {
+            cost_sort_merge_ordered(left_blocks, right_blocks)
+        } else {
+            cost_sort_merge_with_sort(
+                left_blocks, right_blocks,
+                !left_ordered_on_join_key, !right_ordered_on_join_key,
+                MEMORY_BLOCKS,
+            )
+        };
+        if smj < best.0 { best = (smj, "sort_merge"); }
     }
 
-    // Mirror the exact logic inside `exec_cross` so the DP costs what is ACTUALLY executed!
-    
-    // 1. Both ordered? Exec engine chooses Sort-Merge
-    if left_ordered_on_join_key && right_ordered_on_join_key {
-        return (cost_sort_merge_ordered(left_blocks, right_blocks), "sort_merge");
-    }
-
-    // 2. Smaller side fits in RAM? Exec engine chooses Simple Hash
-    let min_card = left_card.min(right_card);
-    if min_card <= 20000 {
-        return (cost_hash_join_simple(left_blocks, right_blocks), "hash_join_simple");
-    }
-
-    // 3. Otherwise, Exec engine falls back to Grace Hash
-    (cost_hash_join_grace(left_blocks, right_blocks), "hash_join_grace")
+    best
 }
 
 /// Find equi-join predicates between two sets of schemas
@@ -761,13 +756,13 @@ fn dp_optimize(
                     continue;
                 }
 
-                // Inside dp_optimize
+                // Estimate join cardinality
+                // Estimate join cardinality
                 let join_card = if has_equi {
-                    // Safe PK-FK assumption: prevents u64::MAX overflow on 6-table joins
+                    // Much better heuristic for 1-to-N relationships (PK/FK)
                     left.cardinality.max(right.cardinality)
                 } else {
-                    // Capped Cartesian fallback
-                    left.cardinality.saturating_mul(right.cardinality).min(100_000_000_000)
+                    left.cardinality.saturating_mul(right.cardinality)
                 };
 
                 // Estimate cost of the join
@@ -972,13 +967,16 @@ fn exec_pipeline(
     block_size: u64, emit: &mut dyn FnMut(Row,&Schema)->Result<()>,
 ) -> Result<Schema> {
     let table = ctx.get_table_specs().iter()
-        .find(|t| t.name==pipeline.scan.table_id).unwrap();
+        .find(|t| t.name==pipeline.scan.table_id)
+        .with_context(|| format!("Table '{}' not found",pipeline.scan.table_id))?;
 
     let base_schema: Schema = table.column_specs.iter()
         .map(|c|(c.column_name.clone(),c.data_type.clone())).collect();
-    let col_types: Vec<DataType> = base_schema.iter().map(|(_,t)|t.clone()).collect();
-    let out_schema = pipeline_output_schema(&base_schema,pipeline);
+    let col_types: Vec<DataType>=base_schema.iter().map(|(_,t)|t.clone()).collect();
+    let out_schema=pipeline_output_schema(&base_schema,pipeline);
+    // let (pre_filters, post_filters) = split_filters_by_schema(&pipeline.filters, &base_schema);
 
+    // Split filters: pre-projection (all cols in base_schema) vs post-projection
     let (pre_filters, post_filters): (Vec<_>, Vec<_>) = pipeline.filters.iter()
         .partition(|f| {
             f.predicates.iter().all(|p| {
@@ -991,30 +989,21 @@ fn exec_pipeline(
             })
         });
 
-    // ── 1. PRE-COMPILE EVERYTHING ──
-    let comp_pre = compile_filters(&pre_filters, &base_schema);
-    let comp_post = compile_filters(&post_filters, &out_schema);
-    let proj_indices = build_pipeline_projection(&base_schema, &pipeline.projects);
-
-    let start = disk_get_file_start(disk_out,disk_in,&table.file_id)?;
-    let num   = disk_get_file_num_blocks(disk_out,disk_in,&table.file_id)?;
+    let start=disk_get_file_start(disk_out,disk_in,&table.file_id)?;
+    let num  =disk_get_file_num_blocks(disk_out,disk_in,&table.file_id)?;
 
     for i in 0..num {
-        let block = disk_read_block(disk_out,disk_in,start+i,block_size)?;
+        let block=disk_read_block(disk_out,disk_in,start+i,block_size)?;
         for row in parse_block(&block,&col_types) {
-            
-            // ── 2. ZERO-ALLOCATION INNER LOOP ──
-            if !passes_compiled(&row, &comp_pre) { continue; }
+            // Apply pre-projection filters against raw schema
+            if !passes_all_filters(&row,&base_schema,&pre_filters) { continue; }
 
-            let final_row = if let Some(ref p) = proj_indices { 
-                p.iter().map(|&idx| row[idx].clone()).collect() 
-            } else { 
-                row 
-            };
+            let final_row=apply_project_chain(row,&base_schema,&pipeline.projects);
 
-            if !passes_compiled(&final_row, &comp_post) { continue; }
+            // Apply post-projection filters against output schema
+            if !passes_all_filters(&final_row,&out_schema,&post_filters) { continue; }
 
-            emit(final_row, &out_schema)?;
+            emit(final_row,&out_schema)?;
         }
     }
     Ok(out_schema)
@@ -1070,18 +1059,15 @@ fn is_physically_ordered(col_name: &str, table_name: &str, ctx: &DbContext) -> b
 }
 
 struct StreamingPipelineReader<'a> {
-    pipeline:     Pipeline<'a>,
-    base_schema:  Schema,
-    col_types:    Vec<DataType>,
-    out_schema:   Schema,
-    comp_pre:     Vec<CompiledPredicate<'a>>, // Compiled!
-    comp_post:    Vec<CompiledPredicate<'a>>, // Compiled!
-    proj_indices: Option<Vec<usize>>,         // Compiled!
-    start_block:  u64,
-    num_blocks:   u64,
-    cur_block:    u64,
-    rows:         Vec<Row>,
-    row_idx:      usize,
+    pipeline:    Pipeline<'a>,
+    base_schema: Schema,
+    col_types:   Vec<DataType>,
+    out_schema:  Schema,
+    start_block: u64,
+    num_blocks:  u64,
+    cur_block:   u64,
+    rows:        Vec<Row>,
+    row_idx:     usize,
 }
 
 impl<'a> StreamingPipelineReader<'a> {
@@ -1092,66 +1078,83 @@ impl<'a> StreamingPipelineReader<'a> {
         disk_in:    &mut (impl BufRead + Read),
         block_size: u64,
     ) -> Result<Self> {
-        let table = ctx.get_table_specs().iter().find(|t| t.name == pipeline.scan.table_id).unwrap();
-        let base_schema: Schema = table.column_specs.iter().map(|c| (c.column_name.clone(), c.data_type.clone())).collect();
-        let col_types: Vec<DataType> = base_schema.iter().map(|(_, t)| t.clone()).collect();
-        let out_schema = pipeline_output_schema(&base_schema, &pipeline);
-        let (pre_filters, post_filters) = split_filters_by_schema(&pipeline.filters, &base_schema);
-        
-        // ── 1. COMPILE ON INIT ──
-        let comp_pre = compile_filters(&pre_filters, &base_schema);
-        let comp_post = compile_filters(&post_filters, &out_schema);
-        let proj_indices = build_pipeline_projection(&base_schema, &pipeline.projects);
+        let table = ctx.get_table_specs().iter()
+            .find(|t| t.name == pipeline.scan.table_id)
+            .with_context(|| format!("Table '{}' not found", pipeline.scan.table_id))?;
 
+        let base_schema: Schema = table.column_specs.iter()
+            .map(|c| (c.column_name.clone(), c.data_type.clone())).collect();
+        let col_types: Vec<DataType> = base_schema.iter()
+            .map(|(_, t)| t.clone()).collect();
+        let out_schema = pipeline_output_schema(&base_schema, &pipeline);
         let start_block = disk_get_file_start(disk_out, disk_in, &table.file_id)?;
         let num_blocks  = disk_get_file_num_blocks(disk_out, disk_in, &table.file_id)?;
 
         Ok(Self {
             pipeline, base_schema, col_types, out_schema,
-            comp_pre, comp_post, proj_indices,
             start_block, num_blocks, cur_block: 0,
             rows: Vec::new(), row_idx: 0,
         })
     }
 
-    fn load_next_block(&mut self, disk_out: &mut impl Write, disk_in: &mut (impl BufRead + Read), block_size: u64) -> Result<bool> {
+    // Load the next block from disk, returns false if exhausted
+    // Replace your existing load_next_block method inside StreamingPipelineReader
+    fn load_next_block(
+        &mut self,
+        disk_out:   &mut impl Write,
+        disk_in:    &mut (impl BufRead + Read),
+        block_size: u64,
+    ) -> Result<bool> {
         if self.cur_block >= self.num_blocks { return Ok(false); }
+        
         self.rows.clear();
-        let n = 32.min(self.num_blocks - self.cur_block);
-        // ONE I/O command instead of 32 separate seeks
-        let data = disk_read_blocks(disk_out, disk_in,
-            self.start_block + self.cur_block, n, block_size)?;
-        for i in 0..n as usize {
-            let chunk = &data[i * block_size as usize..(i + 1) * block_size as usize];
-            self.rows.extend(parse_block(chunk, &self.col_types));
+        let blocks_to_read = 16.min(self.num_blocks - self.cur_block);
+        
+        for _ in 0..blocks_to_read {
+            let block = disk_read_block(disk_out, disk_in,
+                self.start_block + self.cur_block, block_size)?;
+            self.rows.extend(parse_block(&block, &self.col_types));
+            self.cur_block += 1;
         }
-        self.cur_block += n;
+        
         self.row_idx = 0;
         Ok(true)
     }
 
-    fn advance(&mut self, disk_out: &mut impl Write, disk_in: &mut (impl BufRead + Read), block_size: u64) -> Result<()> {
+    // Advance to next row that passes filters, loading blocks as needed
+    fn advance(
+        &mut self,
+        disk_out:   &mut impl Write,
+        disk_in:    &mut (impl BufRead + Read),
+        block_size: u64,
+    ) -> Result<()> {
         self.row_idx += 1;
         loop {
             while self.row_idx < self.rows.len() {
-                // Must pass BOTH pre-filter and post-filter (after projection)
-                if passes_compiled(&self.rows[self.row_idx], &self.comp_pre)
-                    && self.current().is_some()
-                {
+                if passes_all_filters(&self.rows[self.row_idx],
+                    &self.base_schema, &self.pipeline.filters) {
                     return Ok(());
                 }
                 self.row_idx += 1;
             }
-            if !self.load_next_block(disk_out, disk_in, block_size)? { return Ok(()); }
+            // Current block exhausted, load next
+            if !self.load_next_block(disk_out, disk_in, block_size)? {
+                return Ok(()); // exhausted
+            }
         }
     }
 
-    fn init(&mut self, disk_out: &mut impl Write, disk_in: &mut (impl BufRead + Read), block_size: u64) -> Result<()> {
+    // Initialize — load first valid row
+    fn init(
+        &mut self,
+        disk_out:   &mut impl Write,
+        disk_in:    &mut (impl BufRead + Read),
+        block_size: u64,
+    ) -> Result<()> {
         self.load_next_block(disk_out, disk_in, block_size)?;
-        // Skip first row if it fails pre OR post filter
-        if !self.rows.is_empty()
-            && (!passes_compiled(&self.rows[0], &self.comp_pre) || self.current().is_none())
-        {
+        // Find first valid row
+        if !self.rows.is_empty() &&
+            !passes_all_filters(&self.rows[0], &self.base_schema, &self.pipeline.filters) {
             self.advance(disk_out, disk_in, block_size)?;
         }
         Ok(())
@@ -1159,15 +1162,8 @@ impl<'a> StreamingPipelineReader<'a> {
 
     fn current(&self) -> Option<Row> {
         if self.row_idx >= self.rows.len() { return None; }
-        let row = &self.rows[self.row_idx];
-        let projected: Row = if let Some(ref p) = self.proj_indices {
-            p.iter().map(|&idx| row[idx].clone()).collect()
-        } else {
-            row.clone()
-        };
-        // Apply post-projection filter — was silently skipped before
-        if !passes_compiled(&projected, &self.comp_post) { return None; }
-        Some(projected)
+        let row = self.rows[self.row_idx].clone();
+        Some(apply_project_chain(row, &self.base_schema, &self.pipeline.projects))
     }
 
     fn is_exhausted(&self) -> bool {
@@ -1320,34 +1316,18 @@ fn exec_simple_hash_join(
     let bs = disk_get_file_start(disk_out, disk_in, &build_table.file_id)?;
     let bn = disk_get_file_num_blocks(disk_out, disk_in, &build_table.file_id)?;
 
-    // ── SETUP OUTSIDE THE LOOP ──
-    let build_comp_pre = compile_filters(&build_pre, &build_base);
-    let build_comp_post = compile_filters(&build_post, &build_out);
-    let build_proj_indices = build_pipeline_projection(&build_base, &build_pipeline.projects);
-    let build_key_indices: Vec<usize> = equi_pairs.iter().map(|(l, r)| {
-        col_idx(build_schema, if !build_from_right { l } else { r })
-    }).collect();
-
-    let mut build_key_buf = Vec::with_capacity(128);
     for i in 0..bn {
         let block = disk_read_block(disk_out, disk_in, bs + i, block_size)?;
         for row in parse_block(&block, &build_types) {
-            
-            // ── FAST INNER LOOP ──
-            if !passes_compiled(&row, &build_comp_pre) { continue; }
-            
-            let build_row = if let Some(ref p) = build_proj_indices { 
-                p.iter().map(|&idx| row[idx].clone()).collect() 
-            } else { 
-                row 
-            };
-            
-            if !passes_compiled(&build_row, &build_comp_post) { continue; }
-            
-            extract_key_by_indices(&build_row, &build_key_indices, &mut build_key_buf);
-            
-            // We MUST clone here because the HashMap takes permanent ownership of the key!
-            hash_table.entry(build_key_buf.clone()).or_default().push(build_row);
+            if !passes_all_filters(&row, &build_base, &build_pre) { continue; }
+            let row = apply_project_chain(row, &build_base, &build_pipeline.projects);
+            if !passes_all_filters(&row, &build_out, &build_post) { continue; }
+            let key: Vec<u8> = equi_pairs.iter().map(|(lc, rc)| {
+                let col = if build_from_right { rc } else { lc };
+                let idx = build_schema.iter().position(|(n,_)| n == col).unwrap();
+                serialize_val(&row[idx])
+            }).flatten().collect();
+            hash_table.entry(key).or_default().push(row);
         }
     }
 
@@ -1362,26 +1342,19 @@ fn exec_simple_hash_join(
     let (probe_pre, probe_post) = split_filters_by_schema(&probe_pipeline.filters, &probe_base);
     let ps = disk_get_file_start(disk_out, disk_in, &probe_table.file_id)?;
     let pn = disk_get_file_num_blocks(disk_out, disk_in, &probe_table.file_id)?;
-    let probe_comp_pre = compile_filters(&probe_pre, &probe_base);
-    let probe_comp_post = compile_filters(&probe_post, &probe_out);
-    let probe_proj_indices = build_pipeline_projection(&probe_base, &probe_pipeline.projects);
-    let probe_key_indices: Vec<usize> = equi_pairs.iter().map(|(l, r)| {
-        col_idx(&probe_schema, if build_from_right { l } else { r })
-    }).collect();
 
-    let mut probe_key_buf = Vec::with_capacity(128);
     for i in 0..pn {
         let block = disk_read_block(disk_out, disk_in, ps + i, block_size)?;
         for row in parse_block(&block, &probe_types) {
-            // ── FAST INNER LOOP ──
-            if !passes_compiled(&row, &probe_comp_pre) { continue; }
-            let probe_row = if let Some(ref p) = probe_proj_indices { 
-                p.iter().map(|&idx| row[idx].clone()).collect() 
-            } else { row };
-            if !passes_compiled(&probe_row, &probe_comp_post) { continue; }
-            
-            extract_key_by_indices(&probe_row, &probe_key_indices, &mut probe_key_buf);
-            if let Some(build_rows) = hash_table.get(&probe_key_buf) {
+            if !passes_all_filters(&row, &probe_base, &probe_pre) { continue; }
+            let probe_row = apply_project_chain(row, &probe_base, &probe_pipeline.projects);
+            if !passes_all_filters(&probe_row, &probe_out, &probe_post) { continue; }
+            let key: Vec<u8> = equi_pairs.iter().map(|(lc, rc)| {
+                let col = if build_from_right { lc } else { rc };
+                let idx = probe_schema.iter().position(|(n,_)| n == col).unwrap();
+                serialize_val(&probe_row[idx])
+            }).flatten().collect();
+            if let Some(build_rows) = hash_table.get(&key) {
                 for build_row in build_rows {
                     let combined: Row = if build_from_right {
                         let mut c = probe_row.clone(); c.extend_from_slice(build_row); c
@@ -1407,24 +1380,6 @@ fn serialize_val(v: &Data) -> Vec<u8> {
         Data::String(s)  => { let mut b = s.as_bytes().to_vec(); b.push(0); b }
     }
 }
-
-/// Estimate average row bytes for a pipeline's output rows.
-/// Used for memory-aware hash join routing.
-fn estimate_row_bytes(schema: &Schema) -> usize {
-    schema.iter().map(|(_, t)| match t {
-        DataType::Int32   => 4,
-        DataType::Int64   => 8,
-        DataType::Float32 => 4,
-        DataType::Float64 => 8,
-        DataType::String  => 24,  // average string length estimate
-    }).sum::<usize>()
-        + schema.len() * 16  // Rust Data enum overhead per cell
-        + 24                 // Vec<Data> overhead
-}
-
-/// Memory budget for the build side of a hash join — 50% of total budget,
-/// reserved so partitioning, output buffers, and OS overhead can fit.
-const HASH_BUILD_BUDGET: usize = MEMORY_BUDGET_BYTES / 2;  // 6MB
 
 fn exec_cross(
     cross_data:      &CrossData,
@@ -1483,16 +1438,10 @@ fn exec_cross(
         // Simple hash join when smaller side fits in memory
         let left_card  = estimate_scan_cardinality(&cross_data.left, ctx);
         let right_card = estimate_scan_cardinality(&cross_data.right, ctx);
-         // Memory-based decision: can the smaller side's hash table fit in budget?
-        let left_schema  = schema_of(&cross_data.left,  ctx);
-        let right_schema = schema_of(&cross_data.right, ctx);
-        let left_bytes   = left_card  * estimate_row_bytes(&left_schema) as u64;
-        let right_bytes  = right_card * estimate_row_bytes(&right_schema) as u64;
-        let min_bytes    = left_bytes.min(right_bytes);
+        let min_card   = left_card.min(right_card);
 
-        if min_bytes <= HASH_BUILD_BUDGET as u64
-            && try_flatten(&cross_data.left).is_some() 
-            && try_flatten(&cross_data.right).is_some() {
+        if min_card <= 20000 && try_flatten(&cross_data.left).is_some() 
+                            && try_flatten(&cross_data.right).is_some() {
             return exec_simple_hash_join(
                 cross_data, join_predicates,
                 ctx, disk_out, disk_in, block_size, allocator, emit,
@@ -1660,40 +1609,30 @@ fn spill_sort_merge_join_to_anon(
     left_join_col: &str,
     right_join_col: &str,
     theta:         &[&common::query::Predicate],
-    project:       Option<&ProjectData>,
     ctx:           &DbContext,
     disk_out:      &mut impl Write,
     disk_in:       &mut (impl BufRead + Read),
     block_size:    u64,
     allocator:     &mut AnonAllocator,
 ) -> Result<(u64, u64, Schema)> {
-    // Pre-calculate indices ONCE, completely killing the string search!
-    
-    let left_pipeline  = try_flatten(&cross_data.left).expect("sort-merge spill: left must be pipeline");
-    let right_pipeline = try_flatten(&cross_data.right).expect("sort-merge spill: right must be pipeline");
+    let left_pipeline  = try_flatten(&cross_data.left)
+        .expect("sort-merge spill: left must be pipeline");
+    let right_pipeline = try_flatten(&cross_data.right)
+        .expect("sort-merge spill: right must be pipeline");
 
     let mut left  = StreamingPipelineReader::new(left_pipeline,  ctx, disk_out, disk_in, block_size)?;
     let mut right = StreamingPipelineReader::new(right_pipeline, ctx, disk_out, disk_in, block_size)?;
 
-    let combined_schema: Schema = left.out_schema.iter().chain(right.out_schema.iter()).cloned().collect();
+    let combined_schema: Schema = left.out_schema.iter()
+        .chain(right.out_schema.iter()).cloned().collect();
     let left_key_idx  = col_idx(&left.out_schema,  left_join_col);
     let right_key_idx = col_idx(&right.out_schema, right_join_col);
-
-    let out_schema = if let Some(p) = project { project_schema(&combined_schema, p) } else { combined_schema.clone() };
-    
-    
 
     left.init(disk_out, disk_in, block_size)?;
     right.init(disk_out, disk_in, block_size)?;
 
     let anon_start = allocator.next;
     let mut writer = BlockWriter::new(block_size, anon_start);
-    let proj_indices: Option<Vec<usize>> = project.map(|p| {
-        p.column_name_map.iter().map(|(from, _)| col_idx(&combined_schema, from)).collect()
-    });
-    
-    // A reusable buffer for the final output
-    let mut out_row_buf = Vec::with_capacity(256);
 
     loop {
         if left.is_exhausted() || right.is_exhausted() { break; }
@@ -1712,25 +1651,21 @@ fn spill_sort_merge_join_to_anon(
                 let mut right_group: Vec<Row> = Vec::new();
                 loop {
                     let Some(r) = right.current() else { break; };
-                    if r[right_key_idx].partial_cmp(&current_key) != Some(std::cmp::Ordering::Equal) { break; }
+                    if r[right_key_idx].partial_cmp(&current_key)
+                        != Some(std::cmp::Ordering::Equal) { break; }
                     right_group.push(r);
                     right.advance(disk_out, disk_in, block_size)?;
                 }
 
                 loop {
                     let Some(l) = left.current() else { break; };
-                    if l[left_key_idx].partial_cmp(&current_key) != Some(std::cmp::Ordering::Equal) { break; }
+                    if l[left_key_idx].partial_cmp(&current_key)
+                        != Some(std::cmp::Ordering::Equal) { break; }
                     for r in &right_group {
                         let mut combined = l.clone();
                         combined.extend_from_slice(r);
                         if theta.iter().all(|p| eval_predicate(&combined, &combined_schema, p)) {
-                            out_row_buf.clear();
-                            if let Some(ref indices) = proj_indices {
-                                for &idx in indices { serialize_val_into_buf(&combined[idx], &mut out_row_buf); }
-                            } else {
-                                for val in &combined { serialize_val_into_buf(val, &mut out_row_buf); }
-                            }
-                            writer.push_bytes(&out_row_buf, disk_out)?;
+                            writer.push_bytes(&serialize_row_bytes(&combined), disk_out)?;
                         }
                     }
                     left.advance(disk_out, disk_in, block_size)?;
@@ -1741,7 +1676,7 @@ fn spill_sort_merge_join_to_anon(
 
     let (sb, nb) = writer.finish(disk_out)?;
     allocator.next = anon_start + nb;
-    Ok((sb, nb, out_schema))
+    Ok((sb, nb, combined_schema))
 }
 
 // Spill hash join result directly to anon disk.
@@ -1749,7 +1684,7 @@ fn spill_sort_merge_join_to_anon(
 // reading probe blocks AND writing to BlockWriter — no borrow conflict.
 // ── Grace Hash Join ───────────────────────────────────────────────────────────
 
-const NUM_PARTITIONS: usize = 64;
+const NUM_PARTITIONS: usize = 256;
 
 fn hash_key(key: &[u8]) -> usize {
     use std::hash::{Hash, Hasher};
@@ -1783,50 +1718,32 @@ fn exec_grace_hash_join(
     let left_col_types:  Vec<DataType> = left_schema.iter().map(|(_, t)| t.clone()).collect();
     let right_col_types: Vec<DataType> = right_schema.iter().map(|(_, t)| t.clone()).collect();
 
-    // ── COMPILE EVERYTHING ONCE ──
-    let build_key_indices: Vec<usize> = equi_pairs.iter().map(|(_, r)| col_idx(&right_schema, r)).collect();
-    let probe_key_indices: Vec<usize> = equi_pairs.iter().map(|(l, _)| col_idx(&left_schema, l)).collect();
-    let comp_theta = compile_predicates(&theta, &combined_schema);
-
-    let max_build_blocks = (HASH_BUILD_BUDGET as u64) / block_size;
     for p in 0..NUM_PARTITIONS {
         let (ls, ln) = left_parts[p];
         let (rs, rn) = right_parts[p];
         if ln == 0 || rn == 0 { continue; }
 
+        // Build hash table from right partition
         use std::collections::HashMap;
         let mut hash_table: HashMap<Vec<u8>, Vec<Row>> = HashMap::new();
-        let mut build_buf = Vec::with_capacity(128);
-
-        // GUARD: skip oversized partitions instead of OOMing
-        if rn > max_build_blocks {
-            eprintln!("[GHJ] partition {} build={}blk exceeds budget {}blk — skipping",
-                p, rn, max_build_blocks);
-            continue;
-        }
-        
         for i in 0..rn {
             let block = disk_read_block(disk_out, disk_in, rs + i, block_size)?;
             for row in parse_block(&block, &right_col_types) {
-                extract_key_by_indices(&row, &build_key_indices, &mut build_buf);
-                hash_table.entry(build_buf.clone()).or_default().push(row);
+                let key = extract_key(&row, &right_schema, &equi_pairs, false);
+                hash_table.entry(key).or_default().push(row);
             }
         }
-        
-        let mut probe_buf = Vec::with_capacity(128);
+
+        // Probe with left partition
         for i in 0..ln {
             let block = disk_read_block(disk_out, disk_in, ls + i, block_size)?;
             for left_row in parse_block(&block, &left_col_types) {
-                // USE FAST EXTRACTOR
-                extract_key_by_indices(&left_row, &probe_key_indices, &mut probe_buf);
-                
-                if let Some(right_rows) = hash_table.get(&probe_buf) {
+                let key = extract_key(&left_row, &left_schema, &equi_pairs, true);
+                if let Some(right_rows) = hash_table.get(&key) {
                     for right_row in right_rows {
                         let mut combined = left_row.clone();
                         combined.extend_from_slice(right_row);
-                        
-                        // USE COMPILED THETA
-                        if passes_compiled(&combined, &comp_theta) {
+                        if theta.iter().all(|p| eval_predicate(&combined, &combined_schema, p)) {
                             emit(combined, &combined_schema)?;
                         }
                     }
@@ -1842,7 +1759,6 @@ fn exec_grace_hash_join(
 fn spill_grace_hash_join_to_anon(
     cross_data:       &CrossData,
     join_predicates:  &[common::query::Predicate],
-    project:          Option<&ProjectData>,
     ctx:              &DbContext,
     disk_out:         &mut impl Write,
     disk_in:          &mut (impl BufRead + Read),
@@ -1852,34 +1768,20 @@ fn spill_grace_hash_join_to_anon(
     let (left_schema, right_schema, combined_schema, equi_pairs, theta) =
         prepare_join_metadata(cross_data, join_predicates, ctx);
 
-    // Apply projection to the schema
-    let out_schema = if let Some(p) = project { project_schema(&combined_schema, p) } else { combined_schema.clone() };
-
+    // Phase 1: partition both sides
     let (left_parts, right_parts) = partition_both_sides(
         cross_data, &equi_pairs, &left_schema, &right_schema,
         ctx, disk_out, disk_in, block_size, allocator,
     )?;
 
+    // Output writer
     let out_start = allocator.next;
     let mut out_writer = BlockWriter::new(block_size, out_start);
+
     let left_col_types:  Vec<DataType> = left_schema.iter().map(|(_, t)| t.clone()).collect();
     let right_col_types: Vec<DataType> = right_schema.iter().map(|(_, t)| t.clone()).collect();
 
-    // ── COMPILE EVERYTHING ONCE ──
-    let proj_indices: Option<Vec<usize>> = project.map(|p| {
-        p.column_name_map.iter().map(|(from, _)| col_idx(&combined_schema, from)).collect()
-    });
-    
-    // Compile key indices to completely bypass extract_key_into's string search
-    let build_key_indices: Vec<usize> = equi_pairs.iter().map(|(_, r)| col_idx(&right_schema, r)).collect();
-    let probe_key_indices: Vec<usize> = equi_pairs.iter().map(|(l, _)| col_idx(&left_schema, l)).collect();
-    
-    // Compile theta predicates
-    let comp_theta = compile_predicates(&theta, &combined_schema);
-
-    // A reusable buffer for the final output
-    let mut out_row_buf = Vec::with_capacity(256);
-
+    // Phase 2: join each partition pair
     for p in 0..NUM_PARTITIONS {
         let (ls, ln) = left_parts[p];
         let (rs, rn) = right_parts[p];
@@ -1887,39 +1789,24 @@ fn spill_grace_hash_join_to_anon(
 
         use std::collections::HashMap;
         let mut hash_table: HashMap<Vec<u8>, Vec<Row>> = HashMap::new();
-        let mut build_buf = Vec::with_capacity(128);
         for i in 0..rn {
             let block = disk_read_block(disk_out, disk_in, rs + i, block_size)?;
             for row in parse_block(&block, &right_col_types) {
-                
-                // ── FAST EXTRACT ──
-                extract_key_by_indices(&row, &build_key_indices, &mut build_buf);
-                hash_table.entry(build_buf.clone()).or_default().push(row);
+                let key = extract_key(&row, &right_schema, &equi_pairs, false);
+                hash_table.entry(key).or_default().push(row);
             }
         }
-        
-        let mut probe_buf = Vec::with_capacity(128);
+
         for i in 0..ln {
             let block = disk_read_block(disk_out, disk_in, ls + i, block_size)?;
             for left_row in parse_block(&block, &left_col_types) {
-                
-                // ── FAST EXTRACT ──
-                extract_key_by_indices(&left_row, &probe_key_indices, &mut probe_buf);
-                
-                if let Some(right_rows) = hash_table.get(&probe_buf) {
+                let key = extract_key(&left_row, &left_schema, &equi_pairs, true);
+                if let Some(right_rows) = hash_table.get(&key) {
                     for right_row in right_rows {
                         let mut combined = left_row.clone();
                         combined.extend_from_slice(right_row);
-                        
-                        // ── FAST THETA EVAL ──
-                        if passes_compiled(&combined, &comp_theta) {
-                            out_row_buf.clear();
-                            if let Some(ref indices) = proj_indices {
-                                for &idx in indices { serialize_val_into_buf(&combined[idx], &mut out_row_buf); }
-                            } else {
-                                for val in &combined { serialize_val_into_buf(val, &mut out_row_buf); }
-                            }
-                            out_writer.push_bytes(&out_row_buf, disk_out)?;
+                        if theta.iter().all(|p| eval_predicate(&combined, &combined_schema, p)) {
+                            out_writer.push_bytes(&serialize_row_bytes(&combined), disk_out)?;
                         }
                     }
                 }
@@ -1929,7 +1816,7 @@ fn spill_grace_hash_join_to_anon(
 
     let (sb, nb) = out_writer.finish(disk_out)?;
     allocator.next = out_start + nb;
-    Ok((sb, nb, out_schema))
+    Ok((sb, nb, combined_schema))
 }
 
 // ── Shared helpers ────────────────────────────────────────────────────────────
@@ -2001,134 +1888,6 @@ fn extract_key(
     key_bytes
 }
 
-fn extract_key_into(
-    row:        &Row,
-    schema:     &Schema,
-    equi_pairs: &[(String, String)],
-    is_left:    bool,
-    buf:        &mut Vec<u8> // The reusable scratch buffer!
-) {
-    buf.clear(); // Keep the memory capacity, but reset the length to 0
-    for (lc, rc) in equi_pairs {
-        let col = if is_left { lc } else { rc };
-        let idx = schema.iter().position(|(n,_)| n == col).unwrap();
-        match &row[idx] {
-            Data::Int32(x)   => buf.extend_from_slice(&(*x as i64).to_le_bytes()), // Upcast to match old behavior
-            Data::Int64(x)   => buf.extend_from_slice(&x.to_le_bytes()),
-            Data::Float32(x) => buf.extend_from_slice(&(*x as f64).to_le_bytes()), // Upcast
-            Data::Float64(x) => buf.extend_from_slice(&x.to_le_bytes()),
-            Data::String(s)  => { buf.extend_from_slice(s.as_bytes()); buf.push(0); }
-        }
-    }
-}
-
-// 1. The Fast Key Extractor
-fn extract_key_by_indices(row: &Row, indices: &[usize], buf: &mut Vec<u8>) {
-    buf.clear();
-    for &idx in indices {
-        match &row[idx] {
-            Data::Int32(x)   => buf.extend_from_slice(&(*x as i64).to_le_bytes()),
-            Data::Int64(x)   => buf.extend_from_slice(&x.to_le_bytes()),
-            Data::Float32(x) => buf.extend_from_slice(&(*x as f64).to_le_bytes()),
-            Data::Float64(x) => buf.extend_from_slice(&x.to_le_bytes()),
-            Data::String(s)  => { buf.extend_from_slice(s.as_bytes()); buf.push(0); }
-        }
-    }
-}
-
-// 2. The Fast Projector
-fn build_pipeline_projection(base: &Schema, projects: &[&ProjectData]) -> Option<Vec<usize>> {
-    if projects.is_empty() { return None; }
-    let mut current_schema = base.clone();
-    let mut current_indices: Vec<usize> = (0..base.len()).collect();
-
-    for p in projects {
-        let mut next_schema = Vec::new();
-        let mut next_indices = Vec::new();
-        for (from, to) in &p.column_name_map {
-            let idx = current_schema.iter().position(|(n,_)| n == from).unwrap();
-            next_schema.push((to.clone(), current_schema[idx].1.clone()));
-            next_indices.push(current_indices[idx]);
-        }
-        current_schema = next_schema;
-        current_indices = next_indices;
-    }
-    Some(current_indices)
-}
-
-// 3. The Fast Filter
-struct CompiledPredicate<'a> {
-    left_idx: usize,
-    right_val: Option<Data>,
-    right_idx: Option<usize>,
-    op: &'a ComparisionOperator,
-}
-impl<'a> CompiledPredicate<'a> {
-    fn compile(pred: &'a common::query::Predicate, schema: &Schema) -> Self {
-        let left_idx = col_idx(schema, &pred.column_name);
-        let (right_val, right_idx) = match &pred.value {
-            ComparisionValue::Column(c) => (None, Some(col_idx(schema, c))),
-            ComparisionValue::I32(v)    => (Some(Data::Int32(*v)), None),
-            ComparisionValue::I64(v)    => (Some(Data::Int64(*v)), None),
-            ComparisionValue::F32(v)    => (Some(Data::Float32(*v)), None),
-            ComparisionValue::F64(v)    => (Some(Data::Float64(*v)), None),
-            ComparisionValue::String(s) => (Some(Data::String(s.clone())), None),
-        };
-        Self { left_idx, right_val, right_idx, op: &pred.operator }
-    }
-
-    fn eval(&self, row: &Row) -> bool {
-        let left = &row[self.left_idx];
-        let right_ref = if let Some(idx) = self.right_idx { &row[idx] } else { self.right_val.as_ref().unwrap() };
-        
-        if let (Some(l), Some(r)) = (coerce_to_f64(left), coerce_to_f64(right_ref)) {
-            return match self.op {
-                ComparisionOperator::EQ  => l == r,
-                ComparisionOperator::NE  => l != r,
-                ComparisionOperator::GT  => l > r,
-                ComparisionOperator::GTE => l >= r,
-                ComparisionOperator::LT  => l < r,
-                ComparisionOperator::LTE => l <= r,
-            };
-        }
-        match self.op {
-            ComparisionOperator::EQ  => left == right_ref,
-            ComparisionOperator::NE  => left != right_ref,
-            ComparisionOperator::GT  => matches!(left.partial_cmp(right_ref), Some(std::cmp::Ordering::Greater)),
-            ComparisionOperator::GTE => matches!(left.partial_cmp(right_ref), Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)),
-            ComparisionOperator::LT  => matches!(left.partial_cmp(right_ref), Some(std::cmp::Ordering::Less)),
-            ComparisionOperator::LTE => matches!(left.partial_cmp(right_ref), Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)),
-        }
-    }
-}
-
-fn compile_filters<'a>(filters: &[&'a FilterData], schema: &Schema) -> Vec<CompiledPredicate<'a>> {
-    filters.iter().flat_map(|f| f.predicates.iter().map(|p| CompiledPredicate::compile(p, schema))).collect()
-}
-
-fn compile_predicates<'a>(preds: &[&'a common::query::Predicate], schema: &Schema) -> Vec<CompiledPredicate<'a>> {
-    preds.iter().map(|&p| CompiledPredicate::compile(p, schema)).collect()
-}
-
-fn passes_compiled(row: &Row, compiled: &[CompiledPredicate]) -> bool {
-    compiled.iter().all(|c| c.eval(row))
-}
-
-fn compile_sort_specs(schema: &Schema, specs: &[SortSpec]) -> Vec<(usize, bool)> {
-    specs.iter().map(|s| (col_idx(schema, &s.column_name), s.ascending)).collect()
-}
-
-fn compare_rows_fast(a: &Row, b: &Row, compiled_specs: &[(usize, bool)]) -> std::cmp::Ordering {
-    for &(i, ascending) in compiled_specs {
-        let ord = a[i].partial_cmp(&b[i]).unwrap_or(std::cmp::Ordering::Equal);
-        let ord = if ascending { ord } else { ord.reverse() };
-        if ord != std::cmp::Ordering::Equal { return ord; }
-    }
-    std::cmp::Ordering::Equal
-}
-
-
-
 fn partition_both_sides(
     cross_data:   &CrossData,
     equi_pairs:   &[(String, String)],
@@ -2140,65 +1899,59 @@ fn partition_both_sides(
     block_size:   u64,
     allocator:    &mut AnonAllocator,
 ) -> Result<([(u64, u64); NUM_PARTITIONS], [(u64, u64); NUM_PARTITIONS])> {
-    
+    // Allocate block IDs for all partition writers upfront
+    // Each partition writer starts at a pre-allocated position
+    // We use a large sparse region — disk simulator allocates lazily
+    // Allocate block IDs for all partition writers upfront
     let left_partition_starts: Vec<u64> = (0..NUM_PARTITIONS)
-        .map(|_| { let s = allocator.next; allocator.next += 800; s }).collect();
-    
+        .map(|_| { let s = allocator.next; allocator.next += 100_000; s }) // Increased to 100k
+        .collect();
+    let right_partition_starts: Vec<u64> = (0..NUM_PARTITIONS)
+        .map(|_| { let s = allocator.next; allocator.next += 100_000; s }) // Increased to 100k
+        .collect();
 
-    // 1. Partition Left Side and Collect Hashes
+    // Partition left side
     let mut left_writers: Vec<BlockWriter> = left_partition_starts.iter()
-        .map(|&s| BlockWriter::new(block_size, s)).collect();
-    let mut valid_left_hashes: Vec<usize> = Vec::new();
-    let mut skip_right_filter = false;
-    const MAX_HASH_ENTRIES: usize = 800_000; // 800K × 8 bytes = 6.4MB — safe ceiling
+        .map(|&s| BlockWriter::new(block_size, s))
+        .collect();
 
     partition_op(
         &cross_data.left, equi_pairs, true, left_schema,
         ctx, disk_out, disk_in, block_size, allocator, &mut left_writers,
-        Some(&mut valid_left_hashes), None // Collect hashes here
     )?;
 
+    // Flush left writers and record (start, num_blocks)
     let mut left_parts = [(0u64, 0u64); NUM_PARTITIONS];
     for (i, writer) in left_writers.into_iter().enumerate() {
         let (sb, nb) = writer.finish(disk_out)?;
         left_parts[i] = (sb, nb);
-        if nb > 0 { allocator.next = allocator.next.max(sb + nb); }
+        // Update allocator to actual usage
+        if nb > 0 {
+            allocator.next = allocator.next.max(sb + nb);
+        }
     }
 
-    let right_partition_starts: Vec<u64> = (0..NUM_PARTITIONS)
-        .map(|_| { let s = allocator.next; allocator.next += 800; s }).collect();
-
-    if valid_left_hashes.len() > MAX_HASH_ENTRIES {
-        // Too many entries — drop the filter to avoid OOM, pay cost of extra right-side work
-        valid_left_hashes.clear();
-        valid_left_hashes.shrink_to_fit();
-        skip_right_filter = true;
-    } else {
-        valid_left_hashes.sort_unstable();
-        valid_left_hashes.dedup();
-    }
-
-    // 3. Partition Right Side and Filter out wasted rows!
+    // Partition right side
     let mut right_writers: Vec<BlockWriter> = right_partition_starts.iter()
-        .map(|&s| BlockWriter::new(block_size, s)).collect();
+        .map(|&s| BlockWriter::new(block_size, s))
+        .collect();
 
     partition_op(
         &cross_data.right, equi_pairs, false, right_schema,
         ctx, disk_out, disk_in, block_size, allocator, &mut right_writers,
-        None, if skip_right_filter { None } else { Some(&valid_left_hashes) }
     )?;
 
     let mut right_parts = [(0u64, 0u64); NUM_PARTITIONS];
     for (i, writer) in right_writers.into_iter().enumerate() {
         let (sb, nb) = writer.finish(disk_out)?;
         right_parts[i] = (sb, nb);
-        if nb > 0 { allocator.next = allocator.next.max(sb + nb); }
+        if nb > 0 {
+            allocator.next = allocator.next.max(sb + nb);
+        }
     }
 
     Ok((left_parts, right_parts))
 }
-
-
 
 fn partition_op(
     op:          &QueryOp,
@@ -2211,48 +1964,36 @@ fn partition_op(
     block_size:  u64,
     allocator:   &mut AnonAllocator,
     writers:     &mut Vec<BlockWriter>,
-    mut collect_hashes: Option<&mut Vec<usize>>,
-    filter_hashes: Option<&[usize]>,
 ) -> Result<()> {
-    // 1. Safe Fast-Path (Single Pipelines)
+    // Fast path: pipeline
     if let Some(pipeline) = try_flatten(op) {
         return partition_pipeline(&pipeline, equi_pairs, is_left, schema,
-            ctx, disk_out, disk_in, block_size, writers, collect_hashes, filter_hashes);
+            ctx, disk_out, disk_in, block_size, writers);
     }
 
-    // (NOTICE: The Cross/partition_cross_pipelines shortcut is intentionally deleted here to prevent OOMs!)
+    // Special case: Cross(pipeline, pipeline) — load right in RAM, stream left
+    if let QueryOp::Cross(c) = op {
+        if let (Some(left_pipe), Some(right_pipe)) =
+            (try_flatten(&c.left), try_flatten(&c.right))
+        {
+            return partition_cross_pipelines(
+                &left_pipe, &right_pipe, equi_pairs, is_left,
+                ctx, disk_out, disk_in, block_size, writers);
+        }
+    }
 
-    // 2. Safe Generic Fallback (Streams to disk, $O(1)$ memory!)
+    // General case: spill op to anon disk first, then read back and partition
+    // This avoids holding large intermediate results in RAM
     let (spill_start, spill_num, spill_schema) =
         spill_hash_join_to_anon_generic(op, ctx, disk_out, disk_in, block_size, allocator)?;
 
     let col_types: Vec<DataType> = spill_schema.iter().map(|(_, t)| t.clone()).collect();
-    
-    // COMPILE INDICES ONCE
-    let key_indices: Vec<usize> = equi_pairs.iter().map(|(l, r)| {
-        col_idx(&spill_schema, if is_left { l } else { r })
-    }).collect();
 
-    let mut key_buf = Vec::with_capacity(128);
     for i in 0..spill_num {
         let block = disk_read_block(disk_out, disk_in, spill_start + i, block_size)?;
         for row in parse_block(&block, &col_types) {
-            
-            // FAST EXTRACT
-            extract_key_by_indices(&row, &key_indices, &mut key_buf);
-            
-            use std::hash::{Hash, Hasher};
-            use std::collections::hash_map::DefaultHasher;
-            let mut hasher = DefaultHasher::new();
-            key_buf.hash(&mut hasher);
-            let full_hash = hasher.finish() as usize;
-
-            if let Some(ref mut c) = collect_hashes { c.push(full_hash); }
-            if let Some(f) = filter_hashes {
-                if f.binary_search(&full_hash).is_err() { continue; } 
-            }
-
-            let p = full_hash % NUM_PARTITIONS;
+            let key = extract_key(&row, &spill_schema, equi_pairs, is_left);
+            let p = hash_key(&key);
             writers[p].push(&row, disk_out)?;
         }
     }
@@ -2270,11 +2011,12 @@ fn partition_cross_pipelines(
     disk_in:    &mut (impl BufRead + Read),
     block_size: u64,
     writers:    &mut Vec<BlockWriter>,
-    mut collect_hashes: Option<&mut Vec<usize>>,
-    filter_hashes: Option<&[usize]>,
 ) -> Result<()> {
-    let right_table = ctx.get_table_specs().iter().find(|t| t.name == right_pipe.scan.table_id).unwrap();
-    let right_base: Schema = right_table.column_specs.iter().map(|c| (c.column_name.clone(), c.data_type.clone())).collect();
+    let right_table = ctx.get_table_specs().iter()
+        .find(|t| t.name == right_pipe.scan.table_id)
+        .with_context(|| format!("Table '{}' not found", right_pipe.scan.table_id))?;
+    let right_base: Schema = right_table.column_specs.iter()
+        .map(|c| (c.column_name.clone(), c.data_type.clone())).collect();
     let right_types: Vec<DataType> = right_base.iter().map(|(_,t)| t.clone()).collect();
     let right_out = pipeline_output_schema(&right_base, right_pipe);
     let rs = disk_get_file_start(disk_out, disk_in, &right_table.file_id)?;
@@ -2289,15 +2031,18 @@ fn partition_cross_pipelines(
         }
     }
 
-    let left_table = ctx.get_table_specs().iter().find(|t| t.name == left_pipe.scan.table_id).unwrap();
-    let left_base: Schema = left_table.column_specs.iter().map(|c| (c.column_name.clone(), c.data_type.clone())).collect();
+    let left_table = ctx.get_table_specs().iter()
+        .find(|t| t.name == left_pipe.scan.table_id)
+        .with_context(|| format!("Table '{}' not found", left_pipe.scan.table_id))?;
+    let left_base: Schema = left_table.column_specs.iter()
+        .map(|c| (c.column_name.clone(), c.data_type.clone())).collect();
     let left_types: Vec<DataType> = left_base.iter().map(|(_,t)| t.clone()).collect();
     let left_out = pipeline_output_schema(&left_base, left_pipe);
-    let combined_schema: Schema = left_out.iter().chain(right_out.iter()).cloned().collect();
+    let combined_schema: Schema = left_out.iter()
+        .chain(right_out.iter()).cloned().collect();
     let ls = disk_get_file_start(disk_out, disk_in, &left_table.file_id)?;
     let ln = disk_get_file_num_blocks(disk_out, disk_in, &left_table.file_id)?;
 
-    let mut key_buf = Vec::with_capacity(128);
     for i in 0..ln {
         let block = disk_read_block(disk_out, disk_in, ls + i, block_size)?;
         for left_row in parse_block(&block, &left_types) {
@@ -2306,20 +2051,8 @@ fn partition_cross_pipelines(
             for r in &right_rows {
                 let mut combined = l.clone();
                 combined.extend_from_slice(r);
-                extract_key_into(&combined, &combined_schema, equi_pairs, is_left, &mut key_buf);
-                
-                use std::hash::{Hash, Hasher};
-                use std::collections::hash_map::DefaultHasher;
-                let mut hasher = DefaultHasher::new();
-                key_buf.hash(&mut hasher);
-                let full_hash = hasher.finish() as usize;
-
-                if let Some(ref mut c) = collect_hashes { c.push(full_hash); }
-                if let Some(f) = filter_hashes {
-                    if f.binary_search(&full_hash).is_err() { continue; }
-                }
-
-                let p = full_hash % NUM_PARTITIONS;
+                let key = extract_key(&combined, &combined_schema, equi_pairs, is_left);
+                let p = hash_key(&key);
                 writers[p].push(&combined, disk_out)?;
             }
         }
@@ -2337,52 +2070,29 @@ fn partition_pipeline(
     disk_in:     &mut (impl BufRead + Read),
     block_size:  u64,
     writers:     &mut Vec<BlockWriter>,
-    mut collect_hashes: Option<&mut Vec<usize>>,
-    filter_hashes: Option<&[usize]>,
 ) -> Result<()> {
-    let table = ctx.get_table_specs().iter().find(|t| t.name == pipeline.scan.table_id).unwrap();
-    let base_schema: Schema = table.column_specs.iter().map(|c| (c.column_name.clone(), c.data_type.clone())).collect();
+    let table = ctx.get_table_specs().iter()
+        .find(|t| t.name == pipeline.scan.table_id)
+        .with_context(|| format!("Table '{}' not found", pipeline.scan.table_id))?;
+
+    let base_schema: Schema = table.column_specs.iter()
+        .map(|c| (c.column_name.clone(), c.data_type.clone())).collect();
     let col_types: Vec<DataType> = base_schema.iter().map(|(_, t)| t.clone()).collect();
     let out_schema = pipeline_output_schema(&base_schema, pipeline);
     let (pre_filters, post_filters) = split_filters_by_schema(&pipeline.filters, &base_schema);
-    
-    // ── 1. PRE-COMPILE EVERYTHING ──
-    let comp_pre = compile_filters(&pre_filters, &base_schema);
-    let comp_post = compile_filters(&post_filters, &out_schema);
-    let proj_indices = build_pipeline_projection(&base_schema, &pipeline.projects);
-    let key_indices: Vec<usize> = equi_pairs.iter().map(|(l, r)| {
-        col_idx(&out_schema, if is_left { l } else { r })
-    }).collect();
 
     let start = disk_get_file_start(disk_out, disk_in, &table.file_id)?;
     let num   = disk_get_file_num_blocks(disk_out, disk_in, &table.file_id)?;
-    let mut key_buf = Vec::with_capacity(128);
 
     for i in 0..num {
         let block = disk_read_block(disk_out, disk_in, start + i, block_size)?;
         for row in parse_block(&block, &col_types) {
-            
-            // ── 2. ZERO-ALLOCATION INNER LOOP ──
-            if !passes_compiled(&row, &comp_pre) { continue; }
-            let final_row = if let Some(ref p) = proj_indices { 
-                p.iter().map(|&idx| row[idx].clone()).collect() 
-            } else { row };
-            if !passes_compiled(&final_row, &comp_post) { continue; }
-            
-            extract_key_by_indices(&final_row, &key_indices, &mut key_buf);
-            
-            use std::hash::{Hash, Hasher};
-            use std::collections::hash_map::DefaultHasher;
-            let mut hasher = DefaultHasher::new();
-            key_buf.hash(&mut hasher);
-            let full_hash = hasher.finish() as usize;
-
-            if let Some(ref mut c) = collect_hashes { c.push(full_hash); }
-            if let Some(f) = filter_hashes {
-                if f.binary_search(&full_hash).is_err() { continue; }
-            }
-
-            let p = full_hash % NUM_PARTITIONS;
+            if !passes_all_filters(&row, &base_schema, &pre_filters) { continue; }
+            let final_row = apply_project_chain(row, &base_schema, &pipeline.projects);
+            if !passes_all_filters(&final_row, &out_schema, &post_filters) { continue; }
+            let key = extract_key(&final_row, &out_schema, equi_pairs, is_left);
+            let p = hash_key(&key);
+            // Write to partition writer — disk_out used sequentially, no borrow conflict
             writers[p].push(&final_row, disk_out)?;
         }
     }
@@ -2392,18 +2102,14 @@ fn partition_pipeline(
 fn spill_simple_hash_join_to_anon(
     cross_data:      &CrossData,
     join_predicates: &[common::query::Predicate],
-    project:         Option<&ProjectData>,
     ctx:             &DbContext,
     disk_out:        &mut impl Write,
     disk_in:         &mut (impl BufRead + Read),
     block_size:      u64,
     allocator:       &mut AnonAllocator,
 ) -> Result<(u64, u64, Schema)> {
-    
     let (left_schema, right_schema, combined_schema, equi_pairs, theta) =
         prepare_join_metadata(cross_data, join_predicates, ctx);
-
-    
 
     let left_card  = estimate_scan_cardinality(&cross_data.left, ctx);
     let right_card = estimate_scan_cardinality(&cross_data.right, ctx);
@@ -2415,93 +2121,69 @@ fn spill_simple_hash_join_to_anon(
         (&cross_data.left, &cross_data.right, &left_schema, &right_schema)
     };
 
+    // Build hash table from smaller side
     use std::collections::HashMap;
     let mut hash_table: HashMap<Vec<u8>, Vec<Row>> = HashMap::new();
 
     let build_pipeline = try_flatten(build_side).unwrap();
-    let build_table = ctx.get_table_specs().iter().find(|t| t.name == build_pipeline.scan.table_id).unwrap();
-    let build_base: Schema = build_table.column_specs.iter().map(|c| (c.column_name.clone(), c.data_type.clone())).collect();
+    let build_table = ctx.get_table_specs().iter()
+        .find(|t| t.name == build_pipeline.scan.table_id).unwrap();
+    let build_base: Schema = build_table.column_specs.iter()
+        .map(|c| (c.column_name.clone(), c.data_type.clone())).collect();
     let build_types: Vec<DataType> = build_base.iter().map(|(_,t)| t.clone()).collect();
     let build_out = pipeline_output_schema(&build_base, &build_pipeline);
     let (build_pre, build_post) = split_filters_by_schema(&build_pipeline.filters, &build_base);
     let bs = disk_get_file_start(disk_out, disk_in, &build_table.file_id)?;
     let bn = disk_get_file_num_blocks(disk_out, disk_in, &build_table.file_id)?;
 
-    // ── SETUP OUTSIDE THE LOOP ──
-    let build_comp_pre = compile_filters(&build_pre, &build_base);
-    let build_comp_post = compile_filters(&build_post, &build_out);
-    let build_proj_indices = build_pipeline_projection(&build_base, &build_pipeline.projects);
-    let build_key_indices: Vec<usize> = equi_pairs.iter().map(|(l, r)| {
-        col_idx(build_schema, if !build_from_right { l } else { r })
-    }).collect();
-
-    let mut build_key_buf = Vec::with_capacity(128);
     for i in 0..bn {
         let block = disk_read_block(disk_out, disk_in, bs + i, block_size)?;
         for row in parse_block(&block, &build_types) {
-            
-            // ── FAST INNER LOOP ──
-            if !passes_compiled(&row, &build_comp_pre) { continue; }
-            
-            let build_row = if let Some(ref p) = build_proj_indices { 
-                p.iter().map(|&idx| row[idx].clone()).collect() 
-            } else { 
-                row 
-            };
-            
-            if !passes_compiled(&build_row, &build_comp_post) { continue; }
-            
-            extract_key_by_indices(&build_row, &build_key_indices, &mut build_key_buf);
-            
-            // We MUST clone here because the HashMap takes permanent ownership of the key!
-            hash_table.entry(build_key_buf.clone()).or_default().push(build_row);
+            if !passes_all_filters(&row, &build_base, &build_pre) { continue; }
+            let row = apply_project_chain(row, &build_base, &build_pipeline.projects);
+            if !passes_all_filters(&row, &build_out, &build_post) { continue; }
+            let key: Vec<u8> = equi_pairs.iter().flat_map(|(lc, rc)| {
+                let col = if build_from_right { rc } else { lc };
+                let idx = build_schema.iter().position(|(n,_)| n == col).unwrap();
+                serialize_val(&row[idx])
+            }).collect();
+            hash_table.entry(key).or_default().push(row);
         }
     }
 
+    // Probe side — stream it
     let probe_pipeline = try_flatten(probe_side).unwrap();
-    let probe_table = ctx.get_table_specs().iter().find(|t| t.name == probe_pipeline.scan.table_id).unwrap();
-    let probe_base: Schema = probe_table.column_specs.iter().map(|c| (c.column_name.clone(), c.data_type.clone())).collect();
+    let probe_table = ctx.get_table_specs().iter()
+        .find(|t| t.name == probe_pipeline.scan.table_id).unwrap();
+    let probe_base: Schema = probe_table.column_specs.iter()
+        .map(|c| (c.column_name.clone(), c.data_type.clone())).collect();
     let probe_types: Vec<DataType> = probe_base.iter().map(|(_,t)| t.clone()).collect();
     let probe_out = pipeline_output_schema(&probe_base, &probe_pipeline);
     let (probe_pre, probe_post) = split_filters_by_schema(&probe_pipeline.filters, &probe_base);
     let ps = disk_get_file_start(disk_out, disk_in, &probe_table.file_id)?;
     let pn = disk_get_file_num_blocks(disk_out, disk_in, &probe_table.file_id)?;
-    let probe_comp_pre = compile_filters(&probe_pre, &probe_base);
-    let probe_comp_post = compile_filters(&probe_post, &probe_out);
-    let probe_proj_indices = build_pipeline_projection(&probe_base, &probe_pipeline.projects);
-    let probe_key_indices: Vec<usize> = equi_pairs.iter().map(|(l, r)| {
-        col_idx(&probe_schema, if build_from_right { l } else { r })
-    }).collect();
 
     let combined_schema_final: Schema = if build_from_right {
         probe_schema.iter().chain(build_schema.iter()).cloned().collect()
     } else {
         build_schema.iter().chain(probe_schema.iter()).cloned().collect()
     };
-    
-    let out_schema = if let Some(p) = project { project_schema(&combined_schema_final, p) } else { combined_schema_final.clone() };
-    
+
     let out_start = allocator.next;
     let mut writer = BlockWriter::new(block_size, out_start);
-    let proj_indices: Option<Vec<usize>> = project.map(|p| {
-        p.column_name_map.iter().map(|(from, _)| col_idx(&combined_schema_final, from)).collect()
-    });
-    let mut out_row_buf = Vec::with_capacity(256);
-    let mut probe_key_buf = Vec::with_capacity(128);
 
     for i in 0..pn {
         let block = disk_read_block(disk_out, disk_in, ps + i, block_size)?;
         for row in parse_block(&block, &probe_types) {
-            // ── FAST INNER LOOP ──
-            if !passes_compiled(&row, &probe_comp_pre) { continue; }
-            let probe_row = if let Some(ref p) = probe_proj_indices { 
-                p.iter().map(|&idx| row[idx].clone()).collect() 
-            } else { row };
-            if !passes_compiled(&probe_row, &probe_comp_post) { continue; }
-            
-            extract_key_by_indices(&probe_row, &probe_key_indices, &mut probe_key_buf);
-            
-            if let Some(build_rows) = hash_table.get(&probe_key_buf) {
+            if !passes_all_filters(&row, &probe_base, &probe_pre) { continue; }
+            let probe_row = apply_project_chain(row, &probe_base, &probe_pipeline.projects);
+            if !passes_all_filters(&probe_row, &probe_out, &probe_post) { continue; }
+            let key: Vec<u8> = equi_pairs.iter().flat_map(|(lc, rc)| {
+                let col = if build_from_right { lc } else { rc };
+                let idx = probe_schema.iter().position(|(n,_)| n == col).unwrap();
+                serialize_val(&probe_row[idx])
+            }).collect();
+            if let Some(build_rows) = hash_table.get(&key) {
                 for build_row in build_rows {
                     let combined: Row = if build_from_right {
                         let mut c = probe_row.clone(); c.extend_from_slice(build_row); c
@@ -2509,13 +2191,7 @@ fn spill_simple_hash_join_to_anon(
                         let mut c = build_row.clone(); c.extend_from_slice(&probe_row); c
                     };
                     if theta.iter().all(|p| eval_predicate(&combined, &combined_schema_final, p)) {
-                        out_row_buf.clear();
-                        if let Some(ref indices) = proj_indices {
-                            for &idx in indices { serialize_val_into_buf(&combined[idx], &mut out_row_buf); }
-                        } else {
-                            for val in &combined { serialize_val_into_buf(val, &mut out_row_buf); }
-                        }
-                        writer.push_bytes(&out_row_buf, disk_out)?;
+                        writer.push_bytes(&serialize_row_bytes(&combined), disk_out)?;
                     }
                 }
             }
@@ -2524,7 +2200,7 @@ fn spill_simple_hash_join_to_anon(
 
     let (sb, nb) = writer.finish(disk_out)?;
     allocator.next = out_start + nb;
-    Ok((sb, nb, out_schema))
+    Ok((sb, nb, combined_schema_final))
 }
 
 // Generic spill for any op — used for nested Cross children
@@ -2540,26 +2216,24 @@ fn spill_hash_join_to_anon_generic(
         return spill_pipeline_to_anon(&pipe, ctx, disk_out, disk_in, block_size, allocator);
     }
 
-    // Safely capture the project node instead of throwing it away
-    let (inner_op, project_node) = match op {
-        QueryOp::Project(p) => (p.underlying.as_ref(), Some(p)),
-        _ => (op, None),
+    // NEW: Peel off an optional Project wrapper to expose the underlying join
+    let inner_op = match op {
+        QueryOp::Project(p) => p.underlying.as_ref(),
+        _ => op,
     };
 
     if let QueryOp::Filter(f) = inner_op {
         if let QueryOp::Cross(c) = f.underlying.as_ref() {
+            // Check sort-merge first
             let equi_pairs: Vec<(String,String)> = f.predicates.iter()
                 .filter_map(|p| {
                     if p.operator != ComparisionOperator::EQ { return None; }
                     let ComparisionValue::Column(other) = &p.value else { return None; };
                     let ls = schema_of(&c.left, ctx);
                     let rs = schema_of(&c.right, ctx);
-                    let lhs_left  = ls.iter().any(|(n,_)| n == &p.column_name);
+                    let lhs_left = ls.iter().any(|(n,_)| n == &p.column_name);
                     let rhs_right = rs.iter().any(|(n,_)| n == other.as_str());
-                    let lhs_right = rs.iter().any(|(n,_)| n == &p.column_name);
-                    let rhs_left  = ls.iter().any(|(n,_)| n == other.as_str());
                     if lhs_left && rhs_right { Some((p.column_name.clone(), other.clone())) }
-                    else if lhs_right && rhs_left { Some((other.clone(), p.column_name.clone())) }
                     else { None }
                 }).collect();
 
@@ -2574,8 +2248,9 @@ fn spill_hash_join_to_anon_generic(
                 {
                     return spill_sort_merge_join_to_anon(
                         c, &equi_pairs[0].0, &equi_pairs[0].1,
-                        &f.predicates.iter().filter(|p| !matches!(&p.value, ComparisionValue::Column(_))).collect::<Vec<_>>(),
-                        project_node, // Passed down
+                        &f.predicates.iter()
+                            .filter(|p| !matches!(&p.value, ComparisionValue::Column(_)))
+                            .collect::<Vec<_>>(),
                         ctx, disk_out, disk_in, block_size, allocator,
                     );
                 }
@@ -2585,77 +2260,42 @@ fn spill_hash_join_to_anon_generic(
             let lp = try_flatten(&c.left).is_some();
             let rp = try_flatten(&c.right).is_some();
 
-            let left_schema  = schema_of(&c.left, ctx);
-            let right_schema = schema_of(&c.right, ctx);
-            let left_bytes   = left_card  * estimate_row_bytes(&left_schema) as u64;
-            let right_bytes  = right_card * estimate_row_bytes(&right_schema) as u64;
-
-            if lp && rp && left_bytes.min(right_bytes) <= HASH_BUILD_BUDGET as u64{
+            if lp && rp && left_card.min(right_card) <= 20000 {
                 return spill_simple_hash_join_to_anon(
-                    c, &f.predicates, project_node,
+                    c, &f.predicates,
                     ctx, disk_out, disk_in, block_size, allocator,
                 );
             }
 
             return spill_grace_hash_join_to_anon(
-                c, &f.predicates, project_node, // Passed down
+                c, &f.predicates,
                 ctx, disk_out, disk_in, block_size, allocator,
             );
         }
     }
     if let QueryOp::Cross(c) = inner_op {
         return spill_grace_hash_join_to_anon(
-            c, &[], project_node, // Passed down
-            ctx, disk_out, disk_in, block_size, allocator,
+            c, &[], ctx, disk_out, disk_in, block_size, allocator,
         );
     }
-
-    // SAFE FALLBACK: Serialize instantly to avoid memory bloat, 
-    // buffering blocks to disk AFTER execution to bypass borrow checker!
-    let mut blocks: Vec<Vec<u8>> = Vec::new();
-    let mut current_block = vec![0u8; block_size as usize];
-    let mut offset = 0;
-    let mut row_count = 0u16;
+    // Fallback for small results
+    // eprintln!("[SPILL_GENERIC] collecting rows for fallback...");
+    let mut rows: Vec<Row> = Vec::new();
     let mut schema_out: Option<Schema> = None;
-
     let child_schema = execute(op, ctx, disk_out, disk_in, block_size, allocator,
         &mut |row, schema| {
             if schema_out.is_none() { schema_out = Some(schema.clone()); }
-            let rb = serialize_row_bytes(&row);
-            if offset + rb.len() > block_size as usize - 2 {
-                let cnt = row_count.to_le_bytes();
-                current_block[block_size as usize - 2] = cnt[0];
-                current_block[block_size as usize - 1] = cnt[1];
-                blocks.push(current_block.clone());
-                current_block.fill(0);
-                offset = 0;
-                row_count = 0;
-            }
-            current_block[offset..offset + rb.len()].copy_from_slice(&rb);
-            offset += rb.len();
-            row_count += 1;
+            rows.push(row);
             Ok(())
         })?;
-
-    if row_count > 0 {
-        let cnt = row_count.to_le_bytes();
-        current_block[block_size as usize - 2] = cnt[0];
-        current_block[block_size as usize - 1] = cnt[1];
-        blocks.push(current_block);
-    }
-
+    // eprintln!("[SPILL_GENERIC] collected {} rows", rows.len());
+    let schema = schema_out.unwrap_or(child_schema);
     let start = allocator.next;
-    let nb = blocks.len() as u64;
-    for (i, block) in blocks.iter().enumerate() {
-        let id = start + i as u64;
-        disk_out.write_all(format!("put block {} 1\n", id).as_bytes())?;
-        disk_out.write_all(block)?;
-    }
-    disk_out.flush()?;
+    let mut writer = BlockWriter::new(block_size, start);
+    for row in &rows { writer.push(row, disk_out)?; }
+    let (sb, nb) = writer.finish(disk_out)?;
     allocator.next = start + nb;
-    
-    let final_schema = schema_out.unwrap_or(child_schema);
-    Ok((start, nb, final_schema))
+    Ok((sb, nb, schema))
 }
 
 fn exec_sort(
@@ -2687,7 +2327,6 @@ fn exec_sort(
     let mut runs: Vec<(u64, u64)> = Vec::new();
     let mut block_idx = 0u64;
 
-    let comp_sort = compile_sort_specs(&child_schema, &sort_data.sort_specs);
     while block_idx < child_num {
         // Accumulate rows block by block until budget exceeded
         // Track RUST object size, not raw bytes
@@ -2702,7 +2341,7 @@ fn exec_sort(
             blocks_read += 1;
 
             for row in new_rows {
-                batch_bytes += approx_row_size(&row);
+                batch_bytes += serialize_row_bytes(&row).len();
                 batch.push(row);
             }
 
@@ -2716,7 +2355,7 @@ fn exec_sort(
 
         if batch.is_empty() { break; }
 
-        batch.sort_by(|a, b| compare_rows_fast(a, b, &comp_sort));
+        batch.sort_by(|a, b| compare_rows(a, b, &child_schema, &sort_data.sort_specs));
 
         // Only run — emit directly, zero extra disk writes
         if runs.is_empty() && block_idx >= child_num {
@@ -2773,35 +2412,29 @@ fn exec_sort_from_pipeline(
     let mut batch_bytes: usize = 0;
     let mut total_rows: usize = 0;
 
-    // ── COMPILE EVERYTHING ONCE ──
-    let comp_pre = compile_filters(&pre_filters, &base_schema);
-    let comp_post = compile_filters(&post_filters, &out_schema);
-    let proj_indices = build_pipeline_projection(&base_schema, &pipeline.projects);
-    let comp_sort = compile_sort_specs(&out_schema, &sort_data.sort_specs);
-
     for i in 0..num {
         let block = disk_read_block(disk_out, disk_in, start + i, block_size)?;
         for row in parse_block(&block, &col_types) {
-            
-            // ── ZERO-ALLOCATION FAST LOOP ──
-            if !passes_compiled(&row, &comp_pre) { continue; }
-            
-            let final_row = if let Some(ref p) = proj_indices { 
-                p.iter().map(|&idx| row[idx].clone()).collect() 
-            } else { 
-                row 
-            };
-            
-            if !passes_compiled(&final_row, &comp_post) { continue; }
+            if !passes_all_filters(&row, &base_schema, &pre_filters) { continue; }
+            let final_row = apply_project_chain(row, &base_schema, &pipeline.projects);
+            if !passes_all_filters(&final_row, &out_schema, &post_filters) { continue; }
 
-            batch_bytes += approx_row_size(&final_row);
+            // // Debug first row
+            // if total_rows == 0 {
+            //     eprintln!("[SORT_DEBUG] first row size estimate: {}, cols: {}",
+            //         serialize_row_bytes(&final_row).len(), final_row.len());
+            //     eprintln!("[SORT_DEBUG] SORT_RUN_BYTES={}", SORT_RUN_BYTES);
+            // }
+
+            batch_bytes += serialize_row_bytes(&final_row).len();
             batch.push(final_row);
             total_rows += 1;
 
             if batch_bytes > SORT_RUN_BYTES {
-                // USE FAST SORT
-                batch.sort_by(|a, b| compare_rows_fast(a, b, &comp_sort));
-                
+                // eprintln!("[SORT_DEBUG] spilling run at row {}, batch_bytes={}",
+                //     total_rows, batch_bytes);
+                batch.sort_by(|a, b|
+                    compare_rows(a, b, &out_schema, &sort_data.sort_specs));
                 let (rs, rn) = spill_rows_to_anon(&batch, disk_out, block_size, allocator)?;
                 if rn > 0 { runs.push((rs, rn)); }
                 batch.clear();
@@ -2814,14 +2447,14 @@ fn exec_sort_from_pipeline(
 
     if runs.is_empty() {
         batch.sort_by(|a, b|
-            compare_rows_fast(a, b, &comp_sort));
+            compare_rows(a, b, &out_schema, &sort_data.sort_specs));
         for row in batch { emit(row, &out_schema)?; }
         return Ok(out_schema);
     }
 
     if !batch.is_empty() {
         batch.sort_by(|a, b|
-            compare_rows_fast(a, b, &comp_sort));
+            compare_rows(a, b, &out_schema, &sort_data.sort_specs));
         let (rs, rn) = spill_rows_to_anon(&batch, disk_out, block_size, allocator)?;
         if rn > 0 { runs.push((rs, rn)); }
     }
@@ -2839,62 +2472,45 @@ fn merge_runs(
     block_size: u64,
     emit:       &mut dyn FnMut(Row, &Schema) -> Result<()>,
 ) -> Result<()> {
-    use std::collections::BinaryHeap;
-    use std::cmp::Reverse;
-
     let col_types: Vec<DataType> = schema.iter().map(|(_, t)| t.clone()).collect();
-    let comp_sort = compile_sort_specs(schema, &sort_data.sort_specs);
-
-    // Heap entry: (Reverse(row), run_index) — Reverse so smallest row wins
-    // Row must implement Ord: we wrap in a newtype for heap ordering
-    struct HeapEntry {
-        row:      Row,
-        run_idx:  usize,
-        comp_sort: *const Vec<(usize, bool)>, // raw ptr to avoid lifetime issues
-    }
-    impl PartialEq for HeapEntry {
-        fn eq(&self, other: &Self) -> bool { self.cmp(other) == std::cmp::Ordering::Equal }
-    }
-    impl Eq for HeapEntry {}
-    impl PartialOrd for HeapEntry {
-        fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> { Some(self.cmp(other)) }
-    }
-    impl Ord for HeapEntry {
-        fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-            // REVERSED: BinaryHeap is max-heap, we want min-heap
-            let specs = unsafe { &*self.comp_sort };
-            compare_rows_fast(&other.row, &self.row, specs)
-        }
-    }
-
     let mut states: Vec<RunState> = Vec::with_capacity(runs.len());
+
     for (rs, rn) in &runs {
         if *rn == 0 { continue; }
+        
         let mut state = RunState {
-            start_block: *rs,
-            num_blocks:  *rn,
-            cur_block:   0,
-            rows:        std::collections::VecDeque::new(),
+            start_block: *rs, 
+            num_blocks: *rn,
+            cur_block: 0, 
+            rows: std::collections::VecDeque::new(),
         };
+        
+        // Pre-load the first 16 blocks using the new buffered advance logic
         state.advance(disk_out, disk_in, block_size, &col_types)?;
+        
         states.push(state);
     }
 
-    // Seed the heap with the front row of each run
-    let mut heap: BinaryHeap<HeapEntry> = BinaryHeap::with_capacity(states.len());
-    for (i, state) in states.iter().enumerate() {
-        if let Some(row) = state.peek() {
-            heap.push(HeapEntry { row: row.clone(), run_idx: i, comp_sort: &comp_sort });
+    loop {
+        let mut min_idx: Option<usize> = None;
+        for (i, state) in states.iter().enumerate() {
+            if state.peek().is_none() { continue; }
+            match min_idx {
+                None    => min_idx = Some(i),
+                Some(j) => {
+                    if compare_rows(
+                        state.peek().unwrap(), states[j].peek().unwrap(),
+                        schema, &sort_data.sort_specs,
+                    ) == std::cmp::Ordering::Less {
+                        min_idx = Some(i);
+                    }
+                }
+            }
         }
-    }
-
-    while let Some(entry) = heap.pop() {
-        emit(entry.row, schema)?;
-        let i = entry.run_idx;
-        states[i].advance(disk_out, disk_in, block_size, &col_types)?;
-        if let Some(row) = states[i].peek() {
-            heap.push(HeapEntry { row: row.clone(), run_idx: i, comp_sort: &comp_sort });
-        }
+        let Some(idx) = min_idx else { break; };
+        let row = states[idx].peek().unwrap().clone();
+        emit(row, schema)?;
+        states[idx].advance(disk_out, disk_in, block_size, &col_types)?;
     }
     Ok(())
 }
@@ -2913,12 +2529,15 @@ impl RunState {
     fn advance(&mut self, disk_out: &mut impl Write, disk_in: &mut (impl BufRead+Read),
                block_size: u64, col_types: &[DataType]) -> Result<()> {
         self.rows.pop_front();
+        
         if self.rows.is_empty() && self.cur_block < self.num_blocks {
-            // ONE block at a time — keeps total merge-phase memory at K × ~50 rows
-            let block = disk_read_block(disk_out, disk_in,
-                self.start_block + self.cur_block, block_size)?;
-            self.rows.extend(parse_block(&block, col_types));
-            self.cur_block += 1;
+            // Read up to 16 blocks at once to eliminate seek thrashing
+            let blocks_to_read = 16.min(self.num_blocks - self.cur_block);
+            for _ in 0..blocks_to_read {
+                let block = disk_read_block(disk_out, disk_in, self.start_block + self.cur_block, block_size)?;
+                self.rows.extend(parse_block(&block, col_types));
+                self.cur_block += 1; 
+            }
         }
         Ok(())
     }
@@ -3252,89 +2871,11 @@ fn reorder_joins(op: QueryOp, ctx: &DbContext) -> QueryOp {
     }
 }
 
-fn push_project_past_sort(op: QueryOp, ctx: &DbContext) -> QueryOp {
-    match op {
-        QueryOp::Project(p) => {
-            // Peek inside: if child is a Sort, inject an early project under it
-            match *p.underlying {
-                QueryOp::Sort(s) => {
-                    let child_schema = schema_of(&s.underlying, ctx);
-
-                    // Columns required by the outer project (source names before rename)
-                    let mut needed: Vec<String> = p.column_name_map.iter()
-                        .map(|(from, _)| from.clone())
-                        .collect();
-
-                    // Columns required by sort specs — must survive into Sort
-                    for spec in &s.sort_specs {
-                        if !needed.contains(&spec.column_name) {
-                            needed.push(spec.column_name.clone());
-                        }
-                    }
-
-                    // Only worth pushing down if it actually reduces column count
-                    if needed.len() < child_schema.len() {
-                        // Early project: identity-rename only the needed columns
-                        let early_map: Vec<(String, String)> = needed.iter()
-                            .filter(|n| child_schema.iter().any(|(cn, _)| cn == *n))
-                            .map(|n| (n.clone(), n.clone()))
-                            .collect();
-
-                        let early_proj = QueryOp::Project(ProjectData {
-                            column_name_map: early_map,
-                            underlying: Box::new(
-                                push_project_past_sort(*s.underlying, ctx)
-                            ),
-                        });
-
-                        // Sort now operates on the reduced schema
-                        let new_sort = QueryOp::Sort(SortData {
-                            sort_specs: s.sort_specs,
-                            underlying: Box::new(early_proj),
-                        });
-
-                        // Outer project handles final column selection / renaming
-                        QueryOp::Project(ProjectData {
-                            column_name_map: p.column_name_map,
-                            underlying: Box::new(new_sort),
-                        })
-                    } else {
-                        // No reduction possible — reconstruct unchanged
-                        QueryOp::Project(ProjectData {
-                            column_name_map: p.column_name_map,
-                            underlying: Box::new(
-                                push_project_past_sort(QueryOp::Sort(s), ctx)
-                            ),
-                        })
-                    }
-                }
-                other => QueryOp::Project(ProjectData {
-                    column_name_map: p.column_name_map,
-                    underlying: Box::new(push_project_past_sort(other, ctx)),
-                }),
-            }
-        }
-        QueryOp::Sort(s) => QueryOp::Sort(SortData {
-            sort_specs: s.sort_specs,
-            underlying: Box::new(push_project_past_sort(*s.underlying, ctx)),
-        }),
-        QueryOp::Filter(f) => QueryOp::Filter(FilterData {
-            predicates: f.predicates,
-            underlying: Box::new(push_project_past_sort(*f.underlying, ctx)),
-        }),
-        QueryOp::Cross(c) => QueryOp::Cross(CrossData {
-            left:  Box::new(push_project_past_sort(*c.left, ctx)),
-            right: Box::new(push_project_past_sort(*c.right, ctx)),
-        }),
-        QueryOp::Scan(_) => op,
-    }
-}
-
 fn optimize(op: QueryOp, ctx: &DbContext) -> QueryOp {
+    // Step 1: reorder joins on raw tree BEFORE pushing predicates down
     let op = reorder_joins(op, ctx);
-    let op = push_down_pass(op, ctx);
-    // Step 3: push project inside sort — sort only materializes needed columns
-    push_project_past_sort(op, ctx)
+    // Step 2: push predicates down on reordered tree
+    push_down_pass(op, ctx)
 }
 
 fn push_down_pass(op: QueryOp, ctx: &DbContext) -> QueryOp {
