@@ -401,6 +401,17 @@ fn estimate_join_cardinality(
 /// EQ on column C with N distinct values → selectivity = 1/N
 /// Range predicates → use range stats
 /// Other → 0.1 default
+
+fn coerce_to_f64_lenient(v: &Data) -> Option<f64> {
+    match v {
+        Data::Int32(x)   => Some(*x as f64),
+        Data::Int64(x)   => Some(*x as f64),
+        Data::Float32(x) => Some(*x as f64),
+        Data::Float64(x) => Some(*x),
+        Data::String(s)  => s.replace("-", "").parse::<f64>().ok(),
+    }
+}
+
 fn estimate_predicate_selectivity(
     pred:        &common::query::Predicate,
     table_name:  &str,
@@ -411,19 +422,40 @@ fn estimate_predicate_selectivity(
     use ComparisionValue as V;
 
     match (&pred.operator, &pred.value) {
-        (Op::EQ, V::Column(_)) => {
-            // Join predicate — selectivity handled in join estimator
-            1.0
-        }
+        (Op::EQ, V::Column(_)) => 1.0,
         (Op::EQ, _) => {
             stat_distinct_values(table_name, col_name, ctx)
                 .map(|n| 1.0 / (n as f64))
                 .unwrap_or(0.1)
         }
         (Op::NE, _) => 0.9,
-        (Op::LT | Op::LTE | Op::GT | Op::GTE, _) => {
-            // Default range selectivity — could refine with histogram
-            0.33
+        (Op::LT | Op::LTE | Op::GT | Op::GTE, val) => {
+            // Actually use the range stats!
+            if let Some((min_data, max_data)) = stat_range(table_name, col_name, ctx) {
+                let min = coerce_to_f64_lenient(&min_data);
+                let max = coerce_to_f64_lenient(&max_data);
+                let target = match val {
+                    V::I32(x) => Some(*x as f64),
+                    V::I64(x) => Some(*x as f64),
+                    V::F32(x) => Some(*x as f64),
+                    V::F64(x) => Some(*x),
+                    V::String(s) => s.replace("-", "").parse::<f64>().ok(),
+                    _ => None,
+                };
+
+                if let (Some(mn), Some(mx), Some(t)) = (min, max, target) {
+                    if mx > mn {
+                        let ratio = (t - mn) / (mx - mn);
+                        let sel = match &pred.operator {
+                            Op::LT | Op::LTE => ratio,
+                            Op::GT | Op::GTE => 1.0 - ratio,
+                            _ => 0.33,
+                        };
+                        return sel.clamp(0.01, 1.0); // Keep it sane between 1% and 100%
+                    }
+                }
+            }
+            0.33 // Fallback if no stats exist
         }
     }
 }
@@ -602,10 +634,10 @@ fn dp_optimize(
 
     // Detect self-joins (renamed columns) — DP doesn't handle these correctly
     // Fall back to greedy in that case
-    let has_renamed = relations.iter().any(|op| matches!(op, QueryOp::Project(_)));
-    if has_renamed {
-        return build_incremental_join(relations, predicates, ctx);
-    }
+    // let has_renamed = relations.iter().any(|op| matches!(op, QueryOp::Project(_)));
+    // if has_renamed {
+    //     return build_incremental_join(relations, predicates, ctx);
+    // }
 
     // Build relation info for each base table
     let rel_infos: Vec<RelationInfo> = relations.iter()
@@ -633,8 +665,12 @@ fn dp_optimize(
         let local_preds: Vec<common::query::Predicate> = predicates.iter()
             .filter(|p| {
                 let lhs_in = rel.schema.iter().any(|(n,_)| n == &p.column_name);
-                let rhs_literal = !matches!(&p.value, ComparisionValue::Column(_));
-                lhs_in && rhs_literal
+                // Check if the right-hand side is either a literal OR a column in the SAME table
+                let rhs_in = match &p.value {
+                    ComparisionValue::Column(c) => rel.schema.iter().any(|(n,_)| n == c),
+                    _ => true, 
+                };
+                lhs_in && rhs_in
             })
             .cloned()
             .collect();
@@ -708,19 +744,10 @@ fn dp_optimize(
                 }
 
                 // Estimate join cardinality
+                // Estimate join cardinality
                 let join_card = if has_equi {
-                    // Find the equi-pair to estimate selectivity
-                    let equi = join_preds.iter().find(|p| {
-                        p.operator == ComparisionOperator::EQ &&
-                        matches!(&p.value, ComparisionValue::Column(_))
-                    }).unwrap();
-                    let other_col = match &equi.value {
-                        ComparisionValue::Column(c) => c.as_str(),
-                        _ => unreachable!(),
-                    };
-                    // Distinct values estimate from one side
-                    let max_distinct = left.cardinality.max(right.cardinality).max(1);
-                    ((left.cardinality as f64 * right.cardinality as f64) / max_distinct as f64).max(1.0) as u64
+                    // Much better heuristic for 1-to-N relationships (PK/FK)
+                    left.cardinality.max(right.cardinality)
                 } else {
                     left.cardinality.saturating_mul(right.cardinality)
                 };
@@ -1635,9 +1662,9 @@ fn spill_sort_merge_join_to_anon(
 // reading probe blocks AND writing to BlockWriter — no borrow conflict.
 // ── Grace Hash Join ───────────────────────────────────────────────────────────
 
-const NUM_PARTITIONS: usize = 64;
+const NUM_PARTITIONS: usize = 256;
 
-fn hash_key(key: &[String]) -> usize {
+fn hash_key(key: &[u8]) -> usize {
     use std::hash::{Hash, Hasher};
     use std::collections::hash_map::DefaultHasher;
     let mut hasher = DefaultHasher::new();
@@ -1676,7 +1703,7 @@ fn exec_grace_hash_join(
 
         // Build hash table from right partition
         use std::collections::HashMap;
-        let mut hash_table: HashMap<Vec<String>, Vec<Row>> = HashMap::new();
+        let mut hash_table: HashMap<Vec<u8>, Vec<Row>> = HashMap::new();
         for i in 0..rn {
             let block = disk_read_block(disk_out, disk_in, rs + i, block_size)?;
             for row in parse_block(&block, &right_col_types) {
@@ -1739,7 +1766,7 @@ fn spill_grace_hash_join_to_anon(
         if ln == 0 || rn == 0 { continue; }
 
         use std::collections::HashMap;
-        let mut hash_table: HashMap<Vec<String>, Vec<Row>> = HashMap::new();
+        let mut hash_table: HashMap<Vec<u8>, Vec<Row>> = HashMap::new();
         for i in 0..rn {
             let block = disk_read_block(disk_out, disk_in, rs + i, block_size)?;
             for row in parse_block(&block, &right_col_types) {
@@ -1829,13 +1856,14 @@ fn extract_key(
     schema:     &Schema,
     equi_pairs: &[(String, String)],
     is_left:    bool,
-) -> Vec<String> {
-    equi_pairs.iter().map(|(lc, rc)| {
+) -> Vec<u8> {
+    let mut key_bytes = Vec::new();
+    for (lc, rc) in equi_pairs {
         let col = if is_left { lc } else { rc };
-        let idx = schema.iter().position(|(n,_)| n == col)
-            .unwrap_or_else(|| panic!("col {} not in schema", col));
-        format_value(&row[idx])
-    }).collect()
+        let idx = schema.iter().position(|(n,_)| n == col).unwrap();
+        key_bytes.extend_from_slice(&serialize_val(&row[idx]));
+    }
+    key_bytes
 }
 
 fn partition_both_sides(
@@ -2164,7 +2192,14 @@ fn spill_hash_join_to_anon_generic(
     if let Some(pipe) = try_flatten(op) {
         return spill_pipeline_to_anon(&pipe, ctx, disk_out, disk_in, block_size, allocator);
     }
-    if let QueryOp::Filter(f) = op {
+
+    // NEW: Peel off an optional Project wrapper to expose the underlying join
+    let inner_op = match op {
+        QueryOp::Project(p) => p.underlying.as_ref(),
+        _ => op,
+    };
+
+    if let QueryOp::Filter(f) = inner_op {
         if let QueryOp::Cross(c) = f.underlying.as_ref() {
             // Check sort-merge first
             let equi_pairs: Vec<(String,String)> = f.predicates.iter()
@@ -2215,7 +2250,7 @@ fn spill_hash_join_to_anon_generic(
             );
         }
     }
-    if let QueryOp::Cross(c) = op {
+    if let QueryOp::Cross(c) = inner_op {
         return spill_grace_hash_join_to_anon(
             c, &[], ctx, disk_out, disk_in, block_size, allocator,
         );
