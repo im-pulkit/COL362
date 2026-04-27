@@ -67,13 +67,17 @@ impl BlockWriter {
 
     fn flush_pending(&mut self, disk_out: &mut impl Write) -> Result<()> {
         if self.pending.is_empty() { return Ok(()); }
+        let num_to_write = self.pending.len() as u64;
+        let id = self.start_block + self.num_blocks;
+        
+        // Massive optimization: Single simulated command for the entire buffer
+        disk_out.write_all(format!("put block {} {}\n", id, num_to_write).as_bytes())?;
         for p_block in &self.pending {
-            let id = self.start_block + self.num_blocks;
-            disk_out.write_all(format!("put block {} 1\n", id).as_bytes())?;
             disk_out.write_all(p_block)?;
-            self.num_blocks += 1;
         }
         disk_out.flush()?;
+        
+        self.num_blocks += num_to_write;
         self.pending.clear();
         Ok(())
     }
@@ -130,6 +134,15 @@ fn disk_read_block(
     o.write_all(format!("get block {} 1\n", block_id).as_bytes())?;
     o.flush()?;
     let mut buf = vec![0u8; block_size as usize];
+    i.read_exact(&mut buf)?;
+    Ok(buf)
+}
+fn disk_read_blocks(
+    o: &mut impl Write, i: &mut impl Read, start_block: u64, num_blocks: u64, block_size: u64,
+) -> Result<Vec<u8>> {
+    o.write_all(format!("get block {} {}\n", start_block, num_blocks).as_bytes())?;
+    o.flush()?;
+    let mut buf = vec![0u8; (block_size * num_blocks) as usize];
     i.read_exact(&mut buf)?;
     Ok(buf)
 }
@@ -1087,33 +1100,26 @@ impl<'a> StreamingPipelineReader<'a> {
     // Load the next block from disk, returns false if exhausted
     // Replace your existing load_next_block method inside StreamingPipelineReader
     fn load_next_block(
-        &mut self,
-        disk_out:   &mut impl Write,
-        disk_in:    &mut (impl BufRead + Read),
-        block_size: u64,
+        &mut self, disk_out: &mut impl Write, disk_in: &mut (impl BufRead + Read), block_size: u64,
     ) -> Result<bool> {
         if self.cur_block >= self.num_blocks { return Ok(false); }
-        
         self.rows.clear();
-        let blocks_to_read = 16.min(self.num_blocks - self.cur_block);
         
-        for _ in 0..blocks_to_read {
-            let block = disk_read_block(disk_out, disk_in,
-                self.start_block + self.cur_block, block_size)?;
-            self.rows.extend(parse_block(&block, &self.col_types));
-            self.cur_block += 1;
+        let blocks_to_read = 64.min(self.num_blocks - self.cur_block);
+        let buf = disk_read_blocks(disk_out, disk_in, self.start_block + self.cur_block, blocks_to_read, block_size)?;
+        
+        for b in 0..blocks_to_read {
+            let offset = (b * block_size) as usize;
+            self.rows.extend(parse_block(&buf[offset .. offset + block_size as usize], &self.col_types));
         }
         
+        self.cur_block += blocks_to_read;
         self.row_idx = 0;
         Ok(true)
     }
 
-    // Advance to next row that passes filters, loading blocks as needed
     fn advance(
-        &mut self,
-        disk_out:   &mut impl Write,
-        disk_in:    &mut (impl BufRead + Read),
-        block_size: u64,
+        &mut self, disk_out: &mut impl Write, disk_in: &mut (impl BufRead + Read), block_size: u64,
     ) -> Result<()> {
         self.row_idx += 1;
         loop {
@@ -1131,12 +1137,8 @@ impl<'a> StreamingPipelineReader<'a> {
         }
     }
 
-    // Initialize — load first valid row
     fn init(
-        &mut self,
-        disk_out:   &mut impl Write,
-        disk_in:    &mut (impl BufRead + Read),
-        block_size: u64,
+        &mut self, disk_out: &mut impl Write, disk_in: &mut (impl BufRead + Read), block_size: u64,
     ) -> Result<()> {
         self.load_next_block(disk_out, disk_in, block_size)?;
         // Find first valid row
@@ -1671,7 +1673,7 @@ fn spill_sort_merge_join_to_anon(
 // reading probe blocks AND writing to BlockWriter — no borrow conflict.
 // ── Grace Hash Join ───────────────────────────────────────────────────────────
 
-const NUM_PARTITIONS: usize = 256;
+const NUM_PARTITIONS: usize = 64;
 
 fn hash_key(key: &[u8]) -> usize {
     use std::hash::{Hash, Hasher};
@@ -1891,10 +1893,10 @@ fn partition_both_sides(
     // We use a large sparse region — disk simulator allocates lazily
     // Allocate block IDs for all partition writers upfront
     let left_partition_starts: Vec<u64> = (0..NUM_PARTITIONS)
-        .map(|_| { let s = allocator.next; allocator.next += 100_000; s }) // Increased to 100k
+        .map(|_| { let s = allocator.next; allocator.next += 600_000; s }) // Increased to 100k
         .collect();
     let right_partition_starts: Vec<u64> = (0..NUM_PARTITIONS)
-        .map(|_| { let s = allocator.next; allocator.next += 100_000; s }) // Increased to 100k
+        .map(|_| { let s = allocator.next; allocator.next += 600_000; s }) // Increased to 100k
         .collect();
 
     // Partition left side
