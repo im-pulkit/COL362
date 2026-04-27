@@ -1279,36 +1279,33 @@ fn exec_sort_merge_join(
 fn estimate_scan_cardinality(op: &QueryOp, ctx: &DbContext) -> u64 {
     match op {
         QueryOp::Scan(s) => {
-            let table = ctx.get_table_specs().iter()
-                .find(|t| t.name == s.table_id);
-            if let Some(t) = table {
-                for col in &t.column_specs {
-                    if let Some(stats) = &col.stats {
-                        for stat in stats {
-                            if let db_config::statistics::ColumnStat::CardinalityStat(c) = stat {
-                                return c.0;
-                            }
-                        }
-                    }
-                }
-            }
-            10_000 // Sane fallback instead of u64::MAX
+            // Use centralized stat helper for clarity and consistency
+            stat_cardinality(&s.table_id, ctx).unwrap_or(10_000)
         }
         QueryOp::Filter(f) => {
-            // TRAP 1 FIXED: Actually calculate the reduction from predicates!
+            // If the filter wraps a join (Cross) we can't sensibly
+            // attribute predicate selectivities here — be conservative.
+            if matches!(f.underlying.as_ref(), QueryOp::Cross(_)) {
+                return u64::MAX;
+            }
+
+            // Otherwise, estimate underlying cardinality and apply
+            // literal predicate selectivities when the underlying is
+            // a simple scan (table name available). Skip column-vs-column
+            // predicates (join predicates) at this level.
             let mut card = estimate_scan_cardinality(&f.underlying, ctx) as f64;
-            let table_name = get_scan_table_name(&f.underlying).unwrap_or_default();
-            for p in &f.predicates {
-                card *= estimate_predicate_selectivity(p, &table_name, &p.column_name, ctx);
+            if let Some(table_name) = get_scan_table_name(&f.underlying) {
+                for p in &f.predicates {
+                    if matches!(p.value, ComparisionValue::Column(_)) { continue; }
+                    card *= estimate_predicate_selectivity(p, &table_name, &p.column_name, ctx);
+                }
             }
             card.max(1.0) as u64
         }
         QueryOp::Cross(c) => {
-            // TRAP 2 FIXED: For typical PK/FK joins, the result size is 
-            // roughly bounded by the larger of the two participating tables.
-            let l = estimate_scan_cardinality(&c.left, ctx);
-            let r = estimate_scan_cardinality(&c.right, ctx);
-            l.max(r)
+            // Conservatively assume a large result for complex joins so
+            // the planner avoids underestimating and making poor choices.
+            u64::MAX
         }
         QueryOp::Project(p) => estimate_scan_cardinality(&p.underlying, ctx),
         QueryOp::Sort(s)    => estimate_scan_cardinality(&s.underlying, ctx),
