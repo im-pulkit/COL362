@@ -41,52 +41,65 @@ struct BlockWriter {
     row_count:   u16,
     start_block: u64,
     num_blocks:  u64,
+    pending:     Vec<Vec<u8>>, // NEW: Buffer for sequential flushing
 }
 
 impl BlockWriter {
     fn new(block_size: u64, start: u64) -> Self {
         let bs = block_size as usize;
-        Self { block_size: bs, usable: bs - 2, buf: vec![0u8; bs],
-               offset: 0, row_count: 0, start_block: start, num_blocks: 0 }
+        Self {
+            block_size: bs, usable: bs - 2, buf: vec![0u8; bs],
+            offset: 0, row_count: 0, start_block: start, num_blocks: 0,
+            pending: Vec::with_capacity(32),
+        }
+    }
+
+    fn flush_current(&mut self) {
+        if self.row_count == 0 { return; }
+        let cnt = self.row_count.to_le_bytes();
+        self.buf[self.block_size - 2] = cnt[0];
+        self.buf[self.block_size - 1] = cnt[1];
+        self.pending.push(self.buf.clone());
+        self.buf.fill(0);
+        self.offset = 0;
+        self.row_count = 0;
+    }
+
+    fn flush_pending(&mut self, disk_out: &mut impl Write) -> Result<()> {
+        if self.pending.is_empty() { return Ok(()); }
+        for p_block in &self.pending {
+            let id = self.start_block + self.num_blocks;
+            disk_out.write_all(format!("put block {} 1\n", id).as_bytes())?;
+            disk_out.write_all(p_block)?;
+            self.num_blocks += 1;
+        }
+        disk_out.flush()?;
+        self.pending.clear();
+        Ok(())
     }
 
     fn push(&mut self, row: &Row, disk_out: &mut impl Write) -> Result<()> {
         let rb = serialize_row_bytes(row);
-        assert!(rb.len() <= self.usable, "single row too large for block");
-        if self.offset + rb.len() > self.usable { self.flush_block(disk_out)?; }
-        self.buf[self.offset..self.offset + rb.len()].copy_from_slice(&rb);
-        self.offset    += rb.len();
-        self.row_count += 1;
-        Ok(())
+        self.push_bytes(&rb, disk_out)
     }
 
     fn push_bytes(&mut self, rb: &[u8], disk_out: &mut impl Write) -> Result<()> {
-        assert!(rb.len() <= self.usable, "single row too large for block");
-        if self.offset + rb.len() > self.usable { self.flush_block(disk_out)?; }
+        if self.offset + rb.len() > self.usable {
+            self.flush_current();
+            // Flush to disk when we have 32 contiguous blocks ready
+            if self.pending.len() >= 32 {
+                self.flush_pending(disk_out)?;
+            }
+        }
         self.buf[self.offset..self.offset + rb.len()].copy_from_slice(rb);
-        self.offset    += rb.len();
+        self.offset += rb.len();
         self.row_count += 1;
-        Ok(())
-    }
-
-    fn flush_block(&mut self, disk_out: &mut impl Write) -> Result<()> {
-        if self.row_count == 0 { return Ok(()); }
-        let cnt = self.row_count.to_le_bytes();
-        self.buf[self.block_size - 2] = cnt[0];
-        self.buf[self.block_size - 1] = cnt[1];
-        let id = self.start_block + self.num_blocks;
-        disk_out.write_all(format!("put block {} 1\n", id).as_bytes())?;
-        disk_out.write_all(&self.buf)?;
-        disk_out.flush()?;
-        self.num_blocks += 1;
-        self.buf        = vec![0u8; self.block_size];
-        self.offset     = 0;
-        self.row_count  = 0;
         Ok(())
     }
 
     fn finish(mut self, disk_out: &mut impl Write) -> Result<(u64, u64)> {
-        self.flush_block(disk_out)?;
+        self.flush_current();
+        self.flush_pending(disk_out)?;
         Ok((self.start_block, self.num_blocks))
     }
 }
@@ -1084,6 +1097,7 @@ impl<'a> StreamingPipelineReader<'a> {
     }
 
     // Load the next block from disk, returns false if exhausted
+    // Replace your existing load_next_block method inside StreamingPipelineReader
     fn load_next_block(
         &mut self,
         disk_out:   &mut impl Write,
@@ -1091,10 +1105,17 @@ impl<'a> StreamingPipelineReader<'a> {
         block_size: u64,
     ) -> Result<bool> {
         if self.cur_block >= self.num_blocks { return Ok(false); }
-        let block = disk_read_block(disk_out, disk_in,
-            self.start_block + self.cur_block, block_size)?;
-        self.cur_block += 1;
-        self.rows    = parse_block(&block, &self.col_types);
+        
+        self.rows.clear();
+        let blocks_to_read = 16.min(self.num_blocks - self.cur_block);
+        
+        for _ in 0..blocks_to_read {
+            let block = disk_read_block(disk_out, disk_in,
+                self.start_block + self.cur_block, block_size)?;
+            self.rows.extend(parse_block(&block, &self.col_types));
+            self.cur_block += 1;
+        }
+        
         self.row_idx = 0;
         Ok(true)
     }
@@ -2454,12 +2475,18 @@ fn merge_runs(
 
     for (rs, rn) in &runs {
         if *rn == 0 { continue; }
-        let block = disk_read_block(disk_out, disk_in, *rs, block_size)?;
-        let rows  = parse_block(&block, &col_types);
-        states.push(RunState {
-            start_block: *rs, num_blocks: *rn,
-            cur_block: 1, rows, row_idx: 0,
-        });
+        
+        let mut state = RunState {
+            start_block: *rs, 
+            num_blocks: *rn,
+            cur_block: 0, 
+            rows: std::collections::VecDeque::new(),
+        };
+        
+        // Pre-load the first 16 blocks using the new buffered advance logic
+        state.advance(disk_out, disk_in, block_size, &col_types)?;
+        
+        states.push(state);
     }
 
     loop {
@@ -2489,19 +2516,26 @@ fn merge_runs(
 
 struct RunState {
     start_block: u64, num_blocks: u64, cur_block: u64,
-    rows: Vec<Row>, row_idx: usize,
+    rows: std::collections::VecDeque<Row>, // Changed from Vec to VecDeque
 }
+
 impl RunState {
     fn peek(&self) -> Option<&Row> {
-        if self.row_idx < self.rows.len() { Some(&self.rows[self.row_idx]) } else { None }
+        self.rows.front()
     }
+
     fn advance(&mut self, disk_out: &mut impl Write, disk_in: &mut (impl BufRead+Read),
                block_size: u64, col_types: &[DataType]) -> Result<()> {
-        self.row_idx+=1;
-        if self.row_idx>=self.rows.len() && self.cur_block<self.num_blocks {
-            let block=disk_read_block(disk_out,disk_in,self.start_block+self.cur_block,block_size)?;
-            self.rows=parse_block(&block,col_types);
-            self.cur_block+=1; self.row_idx=0;
+        self.rows.pop_front();
+        
+        if self.rows.is_empty() && self.cur_block < self.num_blocks {
+            // Read up to 16 blocks at once to eliminate seek thrashing
+            let blocks_to_read = 16.min(self.num_blocks - self.cur_block);
+            for _ in 0..blocks_to_read {
+                let block = disk_read_block(disk_out, disk_in, self.start_block + self.cur_block, block_size)?;
+                self.rows.extend(parse_block(&block, col_types));
+                self.cur_block += 1; 
+            }
         }
         Ok(())
     }
