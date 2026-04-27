@@ -344,7 +344,10 @@ const COST_WRITE: f64 = 2.0;
 const MEMORY_BLOCKS: u64 = 3072;
 
 /// Number of blocks to read in a single batched I/O to reduce rotational latency.
-const READ_AHEAD_BLOCKS: u64 = 16;
+const READ_AHEAD_BLOCKS: u64 = 32;
+
+/// Prefetch blocks per run during k-way merge — keep very small to limit memory.
+const MERGE_PREFETCH_BLOCKS: u64 = 16;
 
 /// Cost of sequentially scanning a table.
 fn cost_seq_scan(blocks: u64) -> f64 {
@@ -2651,8 +2654,9 @@ impl RunState {
         self.rows.pop_front();
         
         if self.rows.is_empty() && self.cur_block < self.num_blocks {
-            // Read multiple blocks at once to eliminate seek thrashing
-            let blocks_to_read = READ_AHEAD_BLOCKS.min(self.num_blocks - self.cur_block);
+            // During k-way merge we only prefetch a small number of blocks per
+            // run to avoid a large memory spike when many runs are open.
+            let blocks_to_read = MERGE_PREFETCH_BLOCKS.min(self.num_blocks - self.cur_block);
             let data = disk_read_blocks(disk_out, disk_in, self.start_block + self.cur_block, blocks_to_read, block_size)?;
             for b in 0..blocks_to_read as usize {
                 let block = &data[b * block_size as usize..(b + 1) * block_size as usize];
