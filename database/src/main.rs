@@ -1,3 +1,5 @@
+#![allow(dead_code, unused_variables, unused_mut, unused_assignments, unused_imports)]
+
 use anyhow::{Context, Result};
 use clap::Parser;
 use common::{
@@ -1275,40 +1277,29 @@ fn exec_sort_merge_join(
 }
 
 /// Estimate raw table cardinality ignoring filters
-/// Estimate raw table cardinality including filter selectivities
 fn estimate_scan_cardinality(op: &QueryOp, ctx: &DbContext) -> u64 {
     match op {
         QueryOp::Scan(s) => {
-            // Use centralized stat helper for clarity and consistency
-            stat_cardinality(&s.table_id, ctx).unwrap_or(10_000)
-        }
-        QueryOp::Filter(f) => {
-            // If the filter wraps a join (Cross) we can't sensibly
-            // attribute predicate selectivities here — be conservative.
-            if matches!(f.underlying.as_ref(), QueryOp::Cross(_)) {
-                return u64::MAX;
-            }
-
-            // Otherwise, estimate underlying cardinality and apply
-            // literal predicate selectivities when the underlying is
-            // a simple scan (table name available). Skip column-vs-column
-            // predicates (join predicates) at this level.
-            let mut card = estimate_scan_cardinality(&f.underlying, ctx) as f64;
-            if let Some(table_name) = get_scan_table_name(&f.underlying) {
-                for p in &f.predicates {
-                    if matches!(p.value, ComparisionValue::Column(_)) { continue; }
-                    card *= estimate_predicate_selectivity(p, &table_name, &p.column_name, ctx);
+            let table = ctx.get_table_specs().iter()
+                .find(|t| t.name == s.table_id);
+            if let Some(t) = table {
+                for col in &t.column_specs {
+                    if let Some(stats) = &col.stats {
+                        for stat in stats {
+                            if let db_config::statistics::ColumnStat::CardinalityStat(c) = stat {
+                                return c.0;
+                            }
+                        }
+                    }
                 }
             }
-            card.max(1.0) as u64
-        }
-        QueryOp::Cross(c) => {
-            // Conservatively assume a large result for complex joins so
-            // the planner avoids underestimating and making poor choices.
             u64::MAX
         }
+        // Strip away filters/projects/sorts — just get the base table size
+        QueryOp::Filter(f)  => estimate_scan_cardinality(&f.underlying, ctx),
         QueryOp::Project(p) => estimate_scan_cardinality(&p.underlying, ctx),
         QueryOp::Sort(s)    => estimate_scan_cardinality(&s.underlying, ctx),
+        QueryOp::Cross(_)   => u64::MAX, // complex — assume large
     }
 }
 
@@ -2445,7 +2436,6 @@ fn spill_hash_join_to_anon_generic(
         );
     }
     // Fallback for small results
-    // eprintln!("[SPILL_GENERIC] collecting rows for fallback...");
     let mut rows: Vec<Row> = Vec::new();
     let mut schema_out: Option<Schema> = None;
     let child_schema = execute(op, ctx, disk_out, disk_in, block_size, allocator,
@@ -2454,7 +2444,7 @@ fn spill_hash_join_to_anon_generic(
             rows.push(row);
             Ok(())
         })?;
-    // eprintln!("[SPILL_GENERIC] collected {} rows", rows.len());
+    
     let schema = schema_out.unwrap_or(child_schema);
     let start = allocator.next;
     let mut writer = BlockWriter::new(block_size, start);
@@ -2474,18 +2464,17 @@ fn exec_sort(
     emit:       &mut dyn FnMut(Row, &Schema) -> Result<()>,
 ) -> Result<Schema> {
     if let Some(pipeline) = try_flatten(&sort_data.underlying) {
-        // eprintln!("[SORT] using pipeline path for {}", pipeline.scan.table_id);
         return exec_sort_from_pipeline(
             &pipeline, sort_data, ctx, disk_out, disk_in, block_size, allocator, emit
         );
     }
-    // eprintln!("[SORT] using slow path");
+    
 
     let (child_start, child_num, child_schema) =
         spill_hash_join_to_anon_generic(
             &sort_data.underlying, ctx, disk_out, disk_in, block_size, allocator
         )?;
-    // eprintln!("[SORT] child_num={} blocks", child_num);
+    
 
     if child_num == 0 { return Ok(child_schema); }
 
@@ -2516,7 +2505,7 @@ fn exec_sort(
             }
             if batch_bytes >= SORT_RUN_BYTES { break; }
         }
-        // eprintln!("[SORT] batch: {} rows, {} bytes", batch.len(), batch_bytes);
+        
 
         block_idx += blocks_read;
 
@@ -2550,7 +2539,7 @@ fn exec_sort(
             ri += n;
         }
     } else {
-        // eprintln!("[SORT] {} runs to merge", runs.len());
+        
         merge_runs(runs, &child_schema, sort_data, disk_out, disk_in, block_size, emit)?;
     }
 
@@ -2621,7 +2610,7 @@ fn exec_sort_from_pipeline(
         idx += n;
     }
 
-    // eprintln!("[SORT_DEBUG] total_rows={} runs={}", total_rows, runs.len());
+    
 
     if runs.is_empty() {
         let precomp: Vec<(usize, bool)> = sort_data.sort_specs.iter()
