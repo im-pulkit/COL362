@@ -20,7 +20,7 @@ type Row    = Vec<Data>;
 // How much RAM we allow for in-memory Sort/Cross before spilling to disk.
 // Keep well under 64MB to leave room for code, stack, buffers.
 const MEMORY_BUDGET_BYTES: usize = 12 * 1024 * 1024; // 12 MB
-const SORT_RUN_BYTES: usize      = 2 * 1024 * 1024; // 9MB — Sort run size
+const SORT_RUN_BYTES: usize      = 12 * 1024 * 1024; // 12MB — Sort run size
 
 // ── AnonAllocator ─────────────────────────────────────────────────────────────
 
@@ -164,6 +164,13 @@ fn parse_block(block: &[u8], col_types: &[DataType]) -> Vec<Row> {
 }
 
 // ── Row serialization ─────────────────────────────────────────────────────────
+
+fn rust_row_size(row: &Row) -> usize {
+    24 + row.len() * 32 + row.iter().map(|d| match d {
+        Data::String(s) => s.len(),
+        _ => 0,
+    }).sum::<usize>()
+}
 
 fn serialize_row_bytes(row: &Row) -> Vec<u8> {
     let mut b = Vec::new();
@@ -2328,11 +2335,11 @@ fn exec_sort(
             blocks_read += 1;
 
             for row in new_rows {
-                batch_bytes += serialize_row_bytes(&row).len();
+                batch_bytes += rust_row_size(&row);
                 batch.push(row);
             }
 
-            if batch_bytes >= SORT_RUN_BYTES || batch.len() >= 5000 {
+            if batch_bytes >= SORT_RUN_BYTES  {
                 break;
             }
         }
@@ -2413,7 +2420,7 @@ fn exec_sort_from_pipeline(
             //     eprintln!("[SORT_DEBUG] SORT_RUN_BYTES={}", SORT_RUN_BYTES);
             // }
 
-            batch_bytes += serialize_row_bytes(&final_row).len();
+            batch_bytes += rust_row_size(&final_row);
             batch.push(final_row);
             total_rows += 1;
 
@@ -2519,7 +2526,7 @@ impl RunState {
         
         if self.rows.is_empty() && self.cur_block < self.num_blocks {
             // Read up to 16 blocks at once to eliminate seek thrashing
-            let blocks_to_read = 16.min(self.num_blocks - self.cur_block);
+            let blocks_to_read = 1;
             for _ in 0..blocks_to_read {
                 let block = disk_read_block(disk_out, disk_in, self.start_block + self.cur_block, block_size)?;
                 self.rows.extend(parse_block(&block, col_types));
