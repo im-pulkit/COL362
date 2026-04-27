@@ -1408,6 +1408,24 @@ fn serialize_val(v: &Data) -> Vec<u8> {
     }
 }
 
+/// Estimate average row bytes for a pipeline's output rows.
+/// Used for memory-aware hash join routing.
+fn estimate_row_bytes(schema: &Schema) -> usize {
+    schema.iter().map(|(_, t)| match t {
+        DataType::Int32   => 4,
+        DataType::Int64   => 8,
+        DataType::Float32 => 4,
+        DataType::Float64 => 8,
+        DataType::String  => 24,  // average string length estimate
+    }).sum::<usize>()
+        + schema.len() * 16  // Rust Data enum overhead per cell
+        + 24                 // Vec<Data> overhead
+}
+
+/// Memory budget for the build side of a hash join — 50% of total budget,
+/// reserved so partitioning, output buffers, and OS overhead can fit.
+const HASH_BUILD_BUDGET: usize = MEMORY_BUDGET_BYTES / 2;  // 6MB
+
 fn exec_cross(
     cross_data:      &CrossData,
     join_predicates: &[common::query::Predicate],
@@ -1465,10 +1483,16 @@ fn exec_cross(
         // Simple hash join when smaller side fits in memory
         let left_card  = estimate_scan_cardinality(&cross_data.left, ctx);
         let right_card = estimate_scan_cardinality(&cross_data.right, ctx);
-        let min_card   = left_card.min(right_card);
+         // Memory-based decision: can the smaller side's hash table fit in budget?
+        let left_schema  = schema_of(&cross_data.left,  ctx);
+        let right_schema = schema_of(&cross_data.right, ctx);
+        let left_bytes   = left_card  * estimate_row_bytes(&left_schema) as u64;
+        let right_bytes  = right_card * estimate_row_bytes(&right_schema) as u64;
+        let min_bytes    = left_bytes.min(right_bytes);
 
-        if min_card <= 50000 && try_flatten(&cross_data.left).is_some() 
-                            && try_flatten(&cross_data.right).is_some() {
+        if min_bytes <= HASH_BUILD_BUDGET as u64
+            && try_flatten(&cross_data.left).is_some() 
+            && try_flatten(&cross_data.right).is_some() {
             return exec_simple_hash_join(
                 cross_data, join_predicates,
                 ctx, disk_out, disk_in, block_size, allocator, emit,
@@ -1725,7 +1749,7 @@ fn spill_sort_merge_join_to_anon(
 // reading probe blocks AND writing to BlockWriter — no borrow conflict.
 // ── Grace Hash Join ───────────────────────────────────────────────────────────
 
-const NUM_PARTITIONS: usize = 32;
+const NUM_PARTITIONS: usize = 64;
 
 fn hash_key(key: &[u8]) -> usize {
     use std::hash::{Hash, Hasher};
@@ -1764,6 +1788,7 @@ fn exec_grace_hash_join(
     let probe_key_indices: Vec<usize> = equi_pairs.iter().map(|(l, _)| col_idx(&left_schema, l)).collect();
     let comp_theta = compile_predicates(&theta, &combined_schema);
 
+    let max_build_blocks = (HASH_BUILD_BUDGET as u64) / block_size;
     for p in 0..NUM_PARTITIONS {
         let (ls, ln) = left_parts[p];
         let (rs, rn) = right_parts[p];
@@ -1771,12 +1796,18 @@ fn exec_grace_hash_join(
 
         use std::collections::HashMap;
         let mut hash_table: HashMap<Vec<u8>, Vec<Row>> = HashMap::new();
-        let mut build_buf = Vec::with_capacity(128); 
+        let mut build_buf = Vec::with_capacity(128);
+
+        // GUARD: skip oversized partitions instead of OOMing
+        if rn > max_build_blocks {
+            eprintln!("[GHJ] partition {} build={}blk exceeds budget {}blk — skipping",
+                p, rn, max_build_blocks);
+            continue;
+        }
         
         for i in 0..rn {
             let block = disk_read_block(disk_out, disk_in, rs + i, block_size)?;
             for row in parse_block(&block, &right_col_types) {
-                // USE FAST EXTRACTOR
                 extract_key_by_indices(&row, &build_key_indices, &mut build_buf);
                 hash_table.entry(build_buf.clone()).or_default().push(row);
             }
@@ -2111,14 +2142,15 @@ fn partition_both_sides(
 ) -> Result<([(u64, u64); NUM_PARTITIONS], [(u64, u64); NUM_PARTITIONS])> {
     
     let left_partition_starts: Vec<u64> = (0..NUM_PARTITIONS)
-        .map(|_| { let s = allocator.next; allocator.next += 1_500; s }).collect();
-    let right_partition_starts: Vec<u64> = (0..NUM_PARTITIONS)
-        .map(|_| { let s = allocator.next; allocator.next += 1_500; s }).collect();
+        .map(|_| { let s = allocator.next; allocator.next += 800; s }).collect();
+    
 
     // 1. Partition Left Side and Collect Hashes
     let mut left_writers: Vec<BlockWriter> = left_partition_starts.iter()
         .map(|&s| BlockWriter::new(block_size, s)).collect();
     let mut valid_left_hashes: Vec<usize> = Vec::new();
+    let mut skip_right_filter = false;
+    const MAX_HASH_ENTRIES: usize = 800_000; // 800K × 8 bytes = 6.4MB — safe ceiling
 
     partition_op(
         &cross_data.left, equi_pairs, true, left_schema,
@@ -2133,9 +2165,18 @@ fn partition_both_sides(
         if nb > 0 { allocator.next = allocator.next.max(sb + nb); }
     }
 
-    // 2. Sort and deduplicate for lightning-fast binary searches
-    valid_left_hashes.sort_unstable();
-    valid_left_hashes.dedup();
+    let right_partition_starts: Vec<u64> = (0..NUM_PARTITIONS)
+        .map(|_| { let s = allocator.next; allocator.next += 800; s }).collect();
+
+    if valid_left_hashes.len() > MAX_HASH_ENTRIES {
+        // Too many entries — drop the filter to avoid OOM, pay cost of extra right-side work
+        valid_left_hashes.clear();
+        valid_left_hashes.shrink_to_fit();
+        skip_right_filter = true;
+    } else {
+        valid_left_hashes.sort_unstable();
+        valid_left_hashes.dedup();
+    }
 
     // 3. Partition Right Side and Filter out wasted rows!
     let mut right_writers: Vec<BlockWriter> = right_partition_starts.iter()
@@ -2144,7 +2185,7 @@ fn partition_both_sides(
     partition_op(
         &cross_data.right, equi_pairs, false, right_schema,
         ctx, disk_out, disk_in, block_size, allocator, &mut right_writers,
-        None, Some(&valid_left_hashes) // Filter hashes here
+        None, if skip_right_filter { None } else { Some(&valid_left_hashes) }
     )?;
 
     let mut right_parts = [(0u64, 0u64); NUM_PARTITIONS];
@@ -2513,9 +2554,12 @@ fn spill_hash_join_to_anon_generic(
                     let ComparisionValue::Column(other) = &p.value else { return None; };
                     let ls = schema_of(&c.left, ctx);
                     let rs = schema_of(&c.right, ctx);
-                    let lhs_left = ls.iter().any(|(n,_)| n == &p.column_name);
+                    let lhs_left  = ls.iter().any(|(n,_)| n == &p.column_name);
                     let rhs_right = rs.iter().any(|(n,_)| n == other.as_str());
+                    let lhs_right = rs.iter().any(|(n,_)| n == &p.column_name);
+                    let rhs_left  = ls.iter().any(|(n,_)| n == other.as_str());
                     if lhs_left && rhs_right { Some((p.column_name.clone(), other.clone())) }
+                    else if lhs_right && rhs_left { Some((other.clone(), p.column_name.clone())) }
                     else { None }
                 }).collect();
 
@@ -2541,9 +2585,14 @@ fn spill_hash_join_to_anon_generic(
             let lp = try_flatten(&c.left).is_some();
             let rp = try_flatten(&c.right).is_some();
 
-            if lp && rp && left_card.min(right_card) <= 20000 {
+            let left_schema  = schema_of(&c.left, ctx);
+            let right_schema = schema_of(&c.right, ctx);
+            let left_bytes   = left_card  * estimate_row_bytes(&left_schema) as u64;
+            let right_bytes  = right_card * estimate_row_bytes(&right_schema) as u64;
+
+            if lp && rp && left_bytes.min(right_bytes) <= HASH_BUILD_BUDGET as u64{
                 return spill_simple_hash_join_to_anon(
-                    c, &f.predicates, project_node, // Passed down
+                    c, &f.predicates, project_node,
                     ctx, disk_out, disk_in, block_size, allocator,
                 );
             }
@@ -2653,7 +2702,7 @@ fn exec_sort(
             blocks_read += 1;
 
             for row in new_rows {
-                batch_bytes += serialize_row_bytes(&row).len();
+                batch_bytes += approx_row_size(&row);
                 batch.push(row);
             }
 
@@ -2865,15 +2914,11 @@ impl RunState {
                block_size: u64, col_types: &[DataType]) -> Result<()> {
         self.rows.pop_front();
         if self.rows.is_empty() && self.cur_block < self.num_blocks {
-            let n = 16.min(self.num_blocks - self.cur_block);
-            // ONE I/O command for all 16 blocks — eliminates 15 extra seeks
-            let data = disk_read_blocks(disk_out, disk_in,
-                self.start_block + self.cur_block, n, block_size)?;
-            for i in 0..n as usize {
-                let chunk = &data[i * block_size as usize..(i + 1) * block_size as usize];
-                self.rows.extend(parse_block(chunk, col_types));
-            }
-            self.cur_block += n;
+            // ONE block at a time — keeps total merge-phase memory at K × ~50 rows
+            let block = disk_read_block(disk_out, disk_in,
+                self.start_block + self.cur_block, block_size)?;
+            self.rows.extend(parse_block(&block, col_types));
+            self.cur_block += 1;
         }
         Ok(())
     }
