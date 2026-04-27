@@ -837,22 +837,23 @@ fn dp_optimize(
     // Simplification: just apply any leftover predicates on top
     let leftover: Vec<common::query::Predicate> = predicates.into_iter()
         .filter(|p| {
-            // Check if this predicate is still applicable but wasn't in any join
             let in_schema = final_entry.schema.iter().any(|(n,_)| n == &p.column_name);
             let rhs_in = match &p.value {
                 ComparisionValue::Column(c) => final_entry.schema.iter().any(|(n,_)| n == c),
                 _ => true,
             };
-            in_schema && rhs_in &&
-            // Crude check: only literal predicates that weren't captured
-            !matches!(&p.value, ComparisionValue::Column(_)) == false
+            in_schema && rhs_in
         })
         .collect();
 
-    let _ = used_preds;
-    let _ = leftover;
-
-    final_entry.plan
+    if leftover.is_empty() {
+        final_entry.plan
+    } else {
+        QueryOp::Filter(FilterData {
+            predicates: leftover,
+            underlying: Box::new(final_entry.plan),
+        })
+    }
 }
 
 /// Enumerate all subsets of {0..n-1} with given popcount.
@@ -1372,9 +1373,9 @@ fn exec_simple_hash_join(
 
 fn serialize_val(v: &Data) -> Vec<u8> {
     match v {
-        Data::Int32(x)   => x.to_le_bytes().to_vec(),
+        Data::Int32(x)   => (*x as i64).to_le_bytes().to_vec(), // Upcast to i64
         Data::Int64(x)   => x.to_le_bytes().to_vec(),
-        Data::Float32(x) => x.to_le_bytes().to_vec(),
+        Data::Float32(x) => (*x as f64).to_le_bytes().to_vec(), // Upcast to f64
         Data::Float64(x) => x.to_le_bytes().to_vec(),
         Data::String(s)  => { let mut b = s.as_bytes().to_vec(); b.push(0); b }
     }
@@ -1901,11 +1902,12 @@ fn partition_both_sides(
     // Allocate block IDs for all partition writers upfront
     // Each partition writer starts at a pre-allocated position
     // We use a large sparse region — disk simulator allocates lazily
+    // Allocate block IDs for all partition writers upfront
     let left_partition_starts: Vec<u64> = (0..NUM_PARTITIONS)
-        .map(|_| { let s = allocator.next; allocator.next += 4096; s })
+        .map(|_| { let s = allocator.next; allocator.next += 100_000; s }) // Increased to 100k
         .collect();
     let right_partition_starts: Vec<u64> = (0..NUM_PARTITIONS)
-        .map(|_| { let s = allocator.next; allocator.next += 4096; s })
+        .map(|_| { let s = allocator.next; allocator.next += 100_000; s }) // Increased to 100k
         .collect();
 
     // Partition left side
