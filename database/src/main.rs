@@ -243,13 +243,20 @@ fn col_idx(schema: &Schema, name: &str) -> usize {
 }
 
 fn project_schema(schema: &Schema, p: &ProjectData) -> Schema {
-    p.column_name_map.iter()
-        .map(|(from,to)| { let i=col_idx(schema,from); (to.clone(),schema[i].1.clone()) })
-        .collect()
+    let mut res = Vec::with_capacity(p.column_name_map.len());
+    for (from, to) in &p.column_name_map {
+        let i = col_idx(schema, from);
+        res.push((to.clone(), schema[i].1.clone()));
+    }
+    res
 }
 
 fn project_row(row: &Row, schema: &Schema, p: &ProjectData) -> Row {
-    p.column_name_map.iter().map(|(from,_)| row[col_idx(schema,from)].clone()).collect()
+    let mut out = Vec::with_capacity(p.column_name_map.len());
+    let mut indices = Vec::with_capacity(p.column_name_map.len());
+    for (from, _) in &p.column_name_map { indices.push(col_idx(schema, from)); }
+    for i in indices { out.push(row[i].clone()); }
+    out
 }
 
 fn apply_project_chain(row: Row, base: &Schema, projects: &[&ProjectData]) -> Row {
@@ -903,9 +910,13 @@ fn coerce_to_f64(v: &Data) -> Option<f64> {
 }
 
 fn eval_predicate(row: &Row, schema: &Schema, pred: &common::query::Predicate) -> bool {
-    let left = &row[col_idx(schema, &pred.column_name)];
+    let left_idx = col_idx(schema, &pred.column_name);
+    let left = &row[left_idx];
     let right = match &pred.value {
-        ComparisionValue::Column(c) => row[col_idx(schema, c)].clone(),
+        ComparisionValue::Column(c) => {
+            let right_idx = col_idx(schema, c);
+            row[right_idx].clone()
+        }
         ComparisionValue::I32(v)    => Data::Int32(*v),
         ComparisionValue::I64(v)    => Data::Int64(*v),
         ComparisionValue::F32(v)    => Data::Float32(*v),
@@ -1343,9 +1354,8 @@ fn exec_simple_hash_join(
                     let row = apply_project_chain(row, &build_base, &build_pipeline.projects);
                     if !passes_all_filters(&row, &build_out, &build_post) { continue; }
                     let mut key_buf = Vec::new();
-                    for (lc, rc) in &equi_pairs {
-                        let col = if build_from_right { rc } else { lc };
-                        let idx = build_schema.iter().position(|(n,_)| n == col).unwrap();
+                    for (li, ri) in &equi_pairs {
+                        let idx = if build_from_right { *ri } else { *li };
                         serialize_val_into_buf(&row[idx], &mut key_buf);
                     }
                     hash_table.entry(key_buf).or_default().push(row);
@@ -1360,9 +1370,8 @@ fn exec_simple_hash_join(
         let build_schema = col_schema;
         for row in rows {
             let mut key_buf = Vec::new();
-            for (lc, rc) in &equi_pairs {
-                let col = if build_from_right { rc } else { lc };
-                let idx = build_schema.iter().position(|(n,_)| n == col).unwrap();
+            for (li, ri) in &equi_pairs {
+                let idx = if build_from_right { *ri } else { *li };
                 serialize_val_into_buf(&row[idx], &mut key_buf);
             }
             hash_table.entry(key_buf).or_default().push(row);
@@ -1394,9 +1403,8 @@ fn exec_simple_hash_join(
                     let probe_row = apply_project_chain(row, &probe_base, &probe_pipeline.projects);
                     if !passes_all_filters(&probe_row, &probe_out, &probe_post) { continue; }
                     let mut key_buf = Vec::new();
-                    for (lc, rc) in &equi_pairs {
-                        let col = if build_from_right { lc } else { rc };
-                        let idx = probe_schema.iter().position(|(n,_)| n == col).unwrap();
+                    for (li, ri) in &equi_pairs {
+                        let idx = if build_from_right { *li } else { *ri };
                         serialize_val_into_buf(&probe_row[idx], &mut key_buf);
                     }
                     if let Some(build_rows) = hash_table.get(&key_buf) {
@@ -1421,9 +1429,8 @@ fn exec_simple_hash_join(
             &mut |probe_row, _schema| {
                 // `probe_row` already has projections applied by execute
                 let mut key_buf = Vec::new();
-                for (lc, rc) in &equi_pairs {
-                    let col = if build_from_right { lc } else { rc };
-                    let idx = probe_schema.iter().position(|(n,_)| n == col).unwrap();
+                for (li, ri) in &equi_pairs {
+                    let idx = if build_from_right { *li } else { *ri };
                     serialize_val_into_buf(&probe_row[idx], &mut key_buf);
                 }
                 if let Some(build_rows) = hash_table.get(&key_buf) {
@@ -1951,11 +1958,11 @@ fn prepare_join_metadata<'a>(
     cross_data:      &'a CrossData,
     join_predicates: &'a [common::query::Predicate],
     ctx:             &DbContext,
-) -> (Schema, Schema, Schema, Vec<(String, String)>, Vec<&'a common::query::Predicate>) {
+) -> (Schema, Schema, Schema, Vec<(usize, usize)>, Vec<&'a common::query::Predicate>) {
     let left_schema  = schema_of(&cross_data.left, ctx);
     let right_schema = schema_of(&cross_data.right, ctx);
 
-    let mut equi_pairs: Vec<(String, String)> = Vec::new();
+    let mut equi_pairs: Vec<(usize, usize)> = Vec::new();
     let mut theta: Vec<&common::query::Predicate> = Vec::new();
 
     for p in join_predicates {
@@ -1966,10 +1973,14 @@ fn prepare_join_metadata<'a>(
                 let lhs_right = right_schema.iter().any(|(n,_)| n == &p.column_name);
                 let rhs_left  = left_schema.iter().any(|(n,_)| n == other.as_str());
                 if lhs_left && rhs_right {
-                    equi_pairs.push((p.column_name.clone(), other.clone()));
+                    let li = left_schema.iter().position(|(n,_)| n == &p.column_name).unwrap();
+                    let ri = right_schema.iter().position(|(n,_)| n == other.as_str()).unwrap();
+                    equi_pairs.push((li, ri));
                     continue;
                 } else if lhs_right && rhs_left {
-                    equi_pairs.push((other.clone(), p.column_name.clone()));
+                    let li = left_schema.iter().position(|(n,_)| n == other.as_str()).unwrap();
+                    let ri = right_schema.iter().position(|(n,_)| n == &p.column_name).unwrap();
+                    equi_pairs.push((li, ri));
                     continue;
                 }
             }
@@ -1985,14 +1996,13 @@ fn prepare_join_metadata<'a>(
 
 fn extract_key(
     row:        &Row,
-    schema:     &Schema,
-    equi_pairs: &[(String, String)],
+    _schema:    &Schema,
+    equi_pairs: &[(usize, usize)],
     is_left:    bool,
 ) -> Vec<u8> {
     let mut key_bytes = Vec::new();
-    for (lc, rc) in equi_pairs {
-        let col = if is_left { lc } else { rc };
-        let idx = schema.iter().position(|(n,_)| n == col).unwrap();
+    for (li, ri) in equi_pairs {
+        let idx = if is_left { *li } else { *ri };
         key_bytes.extend_from_slice(&serialize_val(&row[idx]));
     }
     key_bytes
@@ -2000,7 +2010,7 @@ fn extract_key(
 
 fn partition_both_sides(
     cross_data:   &CrossData,
-    equi_pairs:   &[(String, String)],
+    equi_pairs:   &[(usize, usize)],
     left_schema:  &Schema,
     right_schema: &Schema,
     ctx:          &DbContext,
@@ -2065,7 +2075,7 @@ fn partition_both_sides(
 
 fn partition_op(
     op:          &QueryOp,
-    equi_pairs:  &[(String, String)],
+    equi_pairs:  &[(usize, usize)],
     is_left:     bool,
     schema:      &Schema,
     ctx:         &DbContext,
@@ -2120,7 +2130,7 @@ fn partition_op(
 fn partition_cross_pipelines(
     left_pipe:  &Pipeline,
     right_pipe: &Pipeline,
-    equi_pairs: &[(String, String)],
+    equi_pairs: &[(usize, usize)],
     is_left:    bool,
     ctx:        &DbContext,
     disk_out:   &mut impl Write,
@@ -2190,7 +2200,7 @@ fn partition_cross_pipelines(
 
 fn partition_pipeline(
     pipeline:    &Pipeline,
-    equi_pairs:  &[(String, String)],
+    equi_pairs:  &[(usize, usize)],
     is_left:     bool,
     _schema:     &Schema,
     ctx:         &DbContext,
@@ -2280,9 +2290,8 @@ fn spill_simple_hash_join_to_anon(
                 let row = apply_project_chain(row, &build_base, &build_pipeline.projects);
                 if !passes_all_filters(&row, &build_out, &build_post) { continue; }
                 let mut key_buf = Vec::new();
-                for (lc, rc) in &equi_pairs {
-                    let col = if build_from_right { rc } else { lc };
-                    let idx = build_schema.iter().position(|(n,_)| n == col).unwrap();
+                for (li, ri) in &equi_pairs {
+                    let idx = if build_from_right { *ri } else { *li };
                     serialize_val_into_buf(&row[idx], &mut key_buf);
                 }
                 hash_table.entry(key_buf).or_default().push(row);
@@ -2323,9 +2332,8 @@ fn spill_simple_hash_join_to_anon(
                 let probe_row = apply_project_chain(row, &probe_base, &probe_pipeline.projects);
                 if !passes_all_filters(&probe_row, &probe_out, &probe_post) { continue; }
                 let mut key_buf = Vec::new();
-                for (lc, rc) in &equi_pairs {
-                    let col = if build_from_right { lc } else { rc };
-                    let idx = probe_schema.iter().position(|(n,_)| n == col).unwrap();
+                for (li, ri) in &equi_pairs {
+                    let idx = if build_from_right { *li } else { *ri };
                     serialize_val_into_buf(&probe_row[idx], &mut key_buf);
                 }
                 if let Some(build_rows) = hash_table.get(&key_buf) {
@@ -2582,7 +2590,16 @@ fn exec_sort_from_pipeline(
                 total_rows += 1;
 
                 if batch_bytes > SORT_RUN_BYTES {
-                    batch.sort_by(|a, b| compare_rows(a, b, &out_schema, &sort_data.sort_specs));
+                    let precomp: Vec<(usize, bool)> = sort_data.sort_specs.iter()
+                        .map(|s| (col_idx(&out_schema, &s.column_name), s.ascending)).collect();
+                    batch.sort_by(|a, b| {
+                        for (i, asc) in &precomp {
+                            let ord = a[*i].partial_cmp(&b[*i]).unwrap_or(std::cmp::Ordering::Equal);
+                            let ord = if *asc { ord } else { ord.reverse() };
+                            if ord != std::cmp::Ordering::Equal { return ord; }
+                        }
+                        std::cmp::Ordering::Equal
+                    });
                     let (rs, rn) = spill_rows_to_anon(&batch, disk_out, block_size, allocator)?;
                     if rn > 0 { runs.push((rs, rn)); }
                     batch.clear();
@@ -2596,15 +2613,31 @@ fn exec_sort_from_pipeline(
     // eprintln!("[SORT_DEBUG] total_rows={} runs={}", total_rows, runs.len());
 
     if runs.is_empty() {
-        batch.sort_by(|a, b|
-            compare_rows(a, b, &out_schema, &sort_data.sort_specs));
+        let precomp: Vec<(usize, bool)> = sort_data.sort_specs.iter()
+            .map(|s| (col_idx(&out_schema, &s.column_name), s.ascending)).collect();
+        batch.sort_by(|a, b| {
+            for (i, asc) in &precomp {
+                let ord = a[*i].partial_cmp(&b[*i]).unwrap_or(std::cmp::Ordering::Equal);
+                let ord = if *asc { ord } else { ord.reverse() };
+                if ord != std::cmp::Ordering::Equal { return ord; }
+            }
+            std::cmp::Ordering::Equal
+        });
         for row in batch { emit(row, &out_schema)?; }
         return Ok(out_schema);
     }
 
     if !batch.is_empty() {
-        batch.sort_by(|a, b|
-            compare_rows(a, b, &out_schema, &sort_data.sort_specs));
+        let precomp: Vec<(usize, bool)> = sort_data.sort_specs.iter()
+            .map(|s| (col_idx(&out_schema, &s.column_name), s.ascending)).collect();
+        batch.sort_by(|a, b| {
+            for (i, asc) in &precomp {
+                let ord = a[*i].partial_cmp(&b[*i]).unwrap_or(std::cmp::Ordering::Equal);
+                let ord = if *asc { ord } else { ord.reverse() };
+                if ord != std::cmp::Ordering::Equal { return ord; }
+            }
+            std::cmp::Ordering::Equal
+        });
         let (rs, rn) = spill_rows_to_anon(&batch, disk_out, block_size, allocator)?;
         if rn > 0 { runs.push((rs, rn)); }
     }
