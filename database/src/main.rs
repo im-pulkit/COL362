@@ -1313,65 +1313,113 @@ fn exec_simple_hash_join(
         (&cross_data.left, &cross_data.right, &left_schema, &right_schema)
     };
 
-    // Build hash table from smaller side
+    // Build hash table from smaller side. Support both flat pipeline sources
+    // (direct table scans) and arbitrary sub-queries by collecting the build
+    // side into memory when necessary.
     use std::collections::HashMap;
     let mut hash_table: HashMap<Vec<u8>, Vec<Row>> = HashMap::new();
 
-    let build_pipeline = try_flatten(build_side).unwrap();
-    let build_table = ctx.get_table_specs().iter()
-        .find(|t| t.name == build_pipeline.scan.table_id).unwrap();
-    let build_base: Schema = build_table.column_specs.iter()
-        .map(|c| (c.column_name.clone(), c.data_type.clone())).collect();
-    let build_types: Vec<DataType> = build_base.iter().map(|(_,t)| t.clone()).collect();
-    let build_out = pipeline_output_schema(&build_base, &build_pipeline);
-    let (build_pre, build_post) = split_filters_by_schema(&build_pipeline.filters, &build_base);
-    let bs = disk_get_file_start(disk_out, disk_in, &build_table.file_id)?;
-    let bn = disk_get_file_num_blocks(disk_out, disk_in, &build_table.file_id)?;
+    // If build side is a flat pipeline (Scan/Filter/Project), stream its
+    // blocks directly; otherwise, collect the build side rows via `execute`.
+    if let Some(build_pipeline) = try_flatten(build_side) {
+        let build_table = ctx.get_table_specs().iter()
+            .find(|t| t.name == build_pipeline.scan.table_id).unwrap();
+        let build_base: Schema = build_table.column_specs.iter()
+            .map(|c| (c.column_name.clone(), c.data_type.clone())).collect();
+        let build_types: Vec<DataType> = build_base.iter().map(|(_,t)| t.clone()).collect();
+        let build_out = pipeline_output_schema(&build_base, &build_pipeline);
+        let (build_pre, build_post) = split_filters_by_schema(&build_pipeline.filters, &build_base);
+        let bs = disk_get_file_start(disk_out, disk_in, &build_table.file_id)?;
+        let bn = disk_get_file_num_blocks(disk_out, disk_in, &build_table.file_id)?;
 
-    let mut bi = 0u64;
-    while bi < bn {
-        let n = READ_AHEAD_BLOCKS.min(bn - bi);
-        let data = disk_read_blocks(disk_out, disk_in, bs + bi, n, block_size)?;
-        for b in 0..n as usize {
-            let block = &data[b * block_size as usize..(b + 1) * block_size as usize];
-            for row in parse_block(block, &build_types) {
-                if !passes_all_filters(&row, &build_base, &build_pre) { continue; }
-                let row = apply_project_chain(row, &build_base, &build_pipeline.projects);
-                if !passes_all_filters(&row, &build_out, &build_post) { continue; }
-                let mut key_buf = Vec::new();
-                for (lc, rc) in &equi_pairs {
-                    let col = if build_from_right { rc } else { lc };
-                    let idx = build_schema.iter().position(|(n,_)| n == col).unwrap();
-                    serialize_val_into_buf(&row[idx], &mut key_buf);
+        let mut bi = 0u64;
+        while bi < bn {
+            let n = READ_AHEAD_BLOCKS.min(bn - bi);
+            let data = disk_read_blocks(disk_out, disk_in, bs + bi, n, block_size)?;
+            for b in 0..n as usize {
+                let block = &data[b * block_size as usize..(b + 1) * block_size as usize];
+                for row in parse_block(block, &build_types) {
+                    if !passes_all_filters(&row, &build_base, &build_pre) { continue; }
+                    let row = apply_project_chain(row, &build_base, &build_pipeline.projects);
+                    if !passes_all_filters(&row, &build_out, &build_post) { continue; }
+                    let mut key_buf = Vec::new();
+                    for (lc, rc) in &equi_pairs {
+                        let col = if build_from_right { rc } else { lc };
+                        let idx = build_schema.iter().position(|(n,_)| n == col).unwrap();
+                        serialize_val_into_buf(&row[idx], &mut key_buf);
+                    }
+                    hash_table.entry(key_buf).or_default().push(row);
                 }
-                hash_table.entry(key_buf).or_default().push(row);
             }
+            bi += n;
         }
-        bi += n;
+    } else {
+        // Collect arbitrary build-side results into memory (acceptable because
+        // we only choose simple-hash when the build side is small).
+        let (col_schema, rows, _bytes) = collect_rows(build_side, ctx, disk_out, disk_in, block_size, allocator)?;
+        let build_schema = col_schema;
+        for row in rows {
+            let mut key_buf = Vec::new();
+            for (lc, rc) in &equi_pairs {
+                let col = if build_from_right { rc } else { lc };
+                let idx = build_schema.iter().position(|(n,_)| n == col).unwrap();
+                serialize_val_into_buf(&row[idx], &mut key_buf);
+            }
+            hash_table.entry(key_buf).or_default().push(row);
+        }
     }
 
-    // Stream probe side
-    let probe_pipeline = try_flatten(probe_side).unwrap();
-    let probe_table = ctx.get_table_specs().iter()
-        .find(|t| t.name == probe_pipeline.scan.table_id).unwrap();
-    let probe_base: Schema = probe_table.column_specs.iter()
-        .map(|c| (c.column_name.clone(), c.data_type.clone())).collect();
-    let probe_types: Vec<DataType> = probe_base.iter().map(|(_,t)| t.clone()).collect();
-    let probe_out = pipeline_output_schema(&probe_base, &probe_pipeline);
-    let (probe_pre, probe_post) = split_filters_by_schema(&probe_pipeline.filters, &probe_base);
-    let ps = disk_get_file_start(disk_out, disk_in, &probe_table.file_id)?;
-    let pn = disk_get_file_num_blocks(disk_out, disk_in, &probe_table.file_id)?;
+    // Stream probe side. If probe side is a flat pipeline we stream blocks
+    // directly; otherwise we execute the probe op and process rows via the
+    // executor to avoid special-casing parsing logic.
+    if let Some(probe_pipeline) = try_flatten(probe_side) {
+        let probe_table = ctx.get_table_specs().iter()
+            .find(|t| t.name == probe_pipeline.scan.table_id).unwrap();
+        let probe_base: Schema = probe_table.column_specs.iter()
+            .map(|c| (c.column_name.clone(), c.data_type.clone())).collect();
+        let probe_types: Vec<DataType> = probe_base.iter().map(|(_,t)| t.clone()).collect();
+        let probe_out = pipeline_output_schema(&probe_base, &probe_pipeline);
+        let (probe_pre, probe_post) = split_filters_by_schema(&probe_pipeline.filters, &probe_base);
+        let ps = disk_get_file_start(disk_out, disk_in, &probe_table.file_id)?;
+        let pn = disk_get_file_num_blocks(disk_out, disk_in, &probe_table.file_id)?;
 
-    let mut pi = 0u64;
-    while pi < pn {
-        let n = READ_AHEAD_BLOCKS.min(pn - pi);
-        let data = disk_read_blocks(disk_out, disk_in, ps + pi, n, block_size)?;
-        for b in 0..n as usize {
-            let block = &data[b * block_size as usize..(b + 1) * block_size as usize];
-            for row in parse_block(block, &probe_types) {
-                if !passes_all_filters(&row, &probe_base, &probe_pre) { continue; }
-                let probe_row = apply_project_chain(row, &probe_base, &probe_pipeline.projects);
-                if !passes_all_filters(&probe_row, &probe_out, &probe_post) { continue; }
+        let mut pi = 0u64;
+        while pi < pn {
+            let n = READ_AHEAD_BLOCKS.min(pn - pi);
+            let data = disk_read_blocks(disk_out, disk_in, ps + pi, n, block_size)?;
+            for b in 0..n as usize {
+                let block = &data[b * block_size as usize..(b + 1) * block_size as usize];
+                for row in parse_block(block, &probe_types) {
+                    if !passes_all_filters(&row, &probe_base, &probe_pre) { continue; }
+                    let probe_row = apply_project_chain(row, &probe_base, &probe_pipeline.projects);
+                    if !passes_all_filters(&probe_row, &probe_out, &probe_post) { continue; }
+                    let mut key_buf = Vec::new();
+                    for (lc, rc) in &equi_pairs {
+                        let col = if build_from_right { lc } else { rc };
+                        let idx = probe_schema.iter().position(|(n,_)| n == col).unwrap();
+                        serialize_val_into_buf(&probe_row[idx], &mut key_buf);
+                    }
+                    if let Some(build_rows) = hash_table.get(&key_buf) {
+                        for build_row in build_rows {
+                            let combined: Row = if build_from_right {
+                                let mut c = probe_row.clone(); c.extend_from_slice(build_row); c
+                            } else {
+                                let mut c = build_row.clone(); c.extend_from_slice(&probe_row); c
+                            };
+                            if theta.iter().all(|p| eval_predicate(&combined, &combined_schema, p)) {
+                                emit(combined, &combined_schema)?;
+                            }
+                        }
+                    }
+                }
+            }
+            pi += n;
+        }
+    } else {
+        // Non-flat probe: execute the probe op and process each emitted row.
+        execute(probe_side, ctx, disk_out, disk_in, block_size, allocator,
+            &mut |probe_row, _schema| {
+                // `probe_row` already has projections applied by execute
                 let mut key_buf = Vec::new();
                 for (lc, rc) in &equi_pairs {
                     let col = if build_from_right { lc } else { rc };
@@ -1390,9 +1438,8 @@ fn exec_simple_hash_join(
                         }
                     }
                 }
-            }
-        }
-        pi += n;
+                Ok(())
+            })?;
     }
     Ok(combined_schema)
 }
