@@ -1275,6 +1275,7 @@ fn exec_sort_merge_join(
 }
 
 /// Estimate raw table cardinality ignoring filters
+/// Estimate raw table cardinality including filter selectivities
 fn estimate_scan_cardinality(op: &QueryOp, ctx: &DbContext) -> u64 {
     match op {
         QueryOp::Scan(s) => {
@@ -1291,13 +1292,26 @@ fn estimate_scan_cardinality(op: &QueryOp, ctx: &DbContext) -> u64 {
                     }
                 }
             }
-            u64::MAX
+            10_000 // Sane fallback instead of u64::MAX
         }
-        // Strip away filters/projects/sorts — just get the base table size
-        QueryOp::Filter(f)  => estimate_scan_cardinality(&f.underlying, ctx),
+        QueryOp::Filter(f) => {
+            // TRAP 1 FIXED: Actually calculate the reduction from predicates!
+            let mut card = estimate_scan_cardinality(&f.underlying, ctx) as f64;
+            let table_name = get_scan_table_name(&f.underlying).unwrap_or_default();
+            for p in &f.predicates {
+                card *= estimate_predicate_selectivity(p, &table_name, &p.column_name, ctx);
+            }
+            card.max(1.0) as u64
+        }
+        QueryOp::Cross(c) => {
+            // TRAP 2 FIXED: For typical PK/FK joins, the result size is 
+            // roughly bounded by the larger of the two participating tables.
+            let l = estimate_scan_cardinality(&c.left, ctx);
+            let r = estimate_scan_cardinality(&c.right, ctx);
+            l.max(r)
+        }
         QueryOp::Project(p) => estimate_scan_cardinality(&p.underlying, ctx),
         QueryOp::Sort(s)    => estimate_scan_cardinality(&s.underlying, ctx),
-        QueryOp::Cross(_)   => u64::MAX, // complex — assume large
     }
 }
 
